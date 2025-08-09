@@ -1,11 +1,10 @@
 {
   "private": true,
   "workspaces": [
-    "apps/web",
-    "apps/scraper",
-    "apps/worker"
+    "apps/*"
   ],
   "scripts": {
-    "scrape": "ts-node apps/scraper/src/scrape.ts"
+    "scrape": "npm run -w apps/scraper scrape",
+    "aggregate": "npm run -w apps/scraper aggregate"
   }
 }
