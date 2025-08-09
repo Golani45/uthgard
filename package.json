@@ -1,0 +1,11 @@
+{
+  "private": true,
+  "workspaces": [
+    "apps/web",
+    "apps/scraper",
+    "apps/worker"
+  ],
+  "scripts": {
+    "scrape": "ts-node apps/scraper/src/scrape.ts"
+  }
+}
