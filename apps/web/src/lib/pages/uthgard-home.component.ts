@@ -3,12 +3,16 @@ import { AcitivityEvent } from "../models/activity-event";
 import { LastWeekBoard } from "../models/last-week-board";
 import { UthgardService } from "../services/uthgard.service";
 import { catchError, combineLatest, Subscription } from "rxjs";
+import { CommonModule } from "@angular/common";
+import { HttpClient } from "@angular/common/http";
+import { TableModule } from "primeng/table";
 
 /**
  * Uthgard home page
  */
 @Component({
   selector: "ac-uthgard-home",
+  imports: [CommonModule, TableModule],
   templateUrl: "./uthgard-home.component.html",
   styleUrls: ["./uthgard-home.component.scss"],
 })

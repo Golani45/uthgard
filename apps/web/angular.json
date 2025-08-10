@@ -21,7 +21,7 @@
               "src/assets",
               { "glob": "**/*", "input": "../data/public", "output": "data" }
             ],
-            "styles": [],
+            "styles": ["./node_modules/primeflex/primeflex.css"],
             "inlineStyleLanguage": "scss"
           },
           "configurations": {
@@ -49,6 +49,9 @@
         },
         "serve": {
           "builder": "@angular/build:dev-server",
+          "options": {
+            "hmr": false
+          },
           "configurations": {
             "production": { "buildTarget": "web:build:production" },
             "development": { "buildTarget": "web:build:development" }

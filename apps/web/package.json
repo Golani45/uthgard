@@ -8,9 +8,10 @@
     "@angular/platform-browser": "^20.1.6",
     "@angular/platform-browser-dynamic": "^20.1.6",
     "@angular/router": "^20.1.6",
+    "@primeuix/themes": "^1.2.3",
     "primeflex": "^4.0.0",
     "primeicons": "^7.0.0",
-    "primeng": "^20.0.0",
+    "primeng": "^20.0.1",
     "rxjs": "~7.8.0",
     "tslib": "^2.3.0",
     "zone.js": "~0.15.0"
@@ -30,7 +31,7 @@
     "typescript": "^5.8.3"
   },
   "scripts": {
-    "start": "ng serve",
+    "start": "ng cache clean && ng serve",
     "build": "ng build --base-href /uthgard/",
     "build:prod": "ng build --configuration production --base-href /uthgard/",
     "test": "ng test"

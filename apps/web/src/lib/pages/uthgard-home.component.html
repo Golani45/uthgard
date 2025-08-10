@@ -1,4 +1,14 @@
 <h2>Recent RvR (last hour)</h2>
+<p-table>
+  <ng-template pTemplate="header">
+    <tr>
+      <th>Name</th>
+      <th>Realm</th>
+      <th>RP +</th>
+      <th>When</th>
+    </tr>
+  </ng-template></p-table
+>
 <table>
   <thead>
     <tr>
@@ -9,7 +19,7 @@
     </tr>
   </thead>
   <tbody>
-    <tr *ngFor="let e of rvr()">
+    <tr *ngFor="let e of rvr">
       <td>{{ e.name }}</td>
       <td>{{ e.realm }}</td>
       <td>{{ e.rpDelta }}</td>
@@ -17,7 +27,6 @@
     </tr>
   </tbody>
 </table>
-test
 <h2>Recent PvE (last hour)</h2>
 <table>
   <thead>
@@ -29,7 +38,7 @@ test
     </tr>
   </thead>
   <tbody>
-    <tr *ngFor="let e of pve()">
+    <tr *ngFor="let e of pve">
       <td>{{ e.name }}</td>
       <td>{{ e.realm }}</td>
       <td>{{ e.event }} {{ e.level ? "L" + e.level : "" }}</td>
@@ -39,7 +48,7 @@ test
 </table>
 
 <h2>Last Week RP</h2>
-<table *ngIf="board() as b">
+<table *ngIf="board as b">
   <caption>
     {{
       b.weekStart
