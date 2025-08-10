@@ -9,6 +9,10 @@
 npm-debug.log
 yarn-error.log
 
+# Angular cache
+.angular/
+**/.angular/
+
 # IDEs and editors
 .idea/
 .project
