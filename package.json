@@ -4,6 +4,7 @@
     "apps/*"
   ],
   "scripts": {
+    "build:scraper": "npm run -w apps/scraper build",
     "scrape": "npm run -w apps/scraper scrape",
     "aggregate": "npm run -w apps/scraper aggregate"
   }

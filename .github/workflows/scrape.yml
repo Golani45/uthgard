@@ -8,6 +8,7 @@ on:
 jobs:
   scrape:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -18,7 +19,16 @@ jobs:
           node-version: 20
 
       - name: Install dependencies
-        run: npm install
+        run: npm ci
 
+      # Build TypeScript to JS
+      - name: Build scraper
+        run: npm run build:scraper
+
+      # Run the compiled JS instead of ts-node
       - name: Run scraper
         run: npm run scrape
+
+      # Optional: run aggregation if needed
+      - name: Run aggregation
+        run: npm run aggregate

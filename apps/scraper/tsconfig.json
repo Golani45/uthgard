@@ -3,11 +3,11 @@
     "target": "ES2022",
     "module": "CommonJS",
     "moduleResolution": "Node",
+    "outDir": "dist",
     "esModuleInterop": true,
     "strict": true,
-    "outDir": "dist",
-    "resolveJsonModule": true,
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "resolveJsonModule": true
   },
   "include": ["src"]
 }
