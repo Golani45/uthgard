@@ -1,0 +1,54 @@
+name: Deploy web
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - "data/public/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      # install Angular app deps
+      - name: Install web deps
+        working-directory: apps/web
+        run: npm ci
+
+      # build Angular
+      - name: Build web
+        working-directory: apps/web
+        run: npm run build -- --configuration production
+
+      # copy JSON into the built site so it's served at /data/...
+      - name: Copy data
+        run: |
+          mkdir -p apps/web/dist/web/browser/data
+          cp -r data/public/* apps/web/dist/web/browser/data/
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: apps/web/dist/web/browser
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4

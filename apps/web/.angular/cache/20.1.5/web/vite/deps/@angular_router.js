@@ -1,30 +1,30 @@
 import {
+  Title
+} from "./chunk-X4CM5ULN.js";
+import "./chunk-MOGQTTFT.js";
+import {
   HashLocationStrategy,
   LOCATION_INITIALIZED,
   Location,
   LocationStrategy,
   PathLocationStrategy,
-  Title,
   ViewportScroller
-} from "./chunk-IB5SPAVG.js";
+} from "./chunk-WMGCTHXR.js";
+import "./chunk-EBDT5XBU.js";
 import {
   APP_BOOTSTRAP_LISTENER,
   ApplicationRef,
   Attribute,
-  BehaviorSubject,
   ChangeDetectorRef,
   Compiler,
   Component,
-  ConnectableObservable,
   Console,
   ContentChildren,
   DOCUMENT,
   DestroyRef,
   Directive,
-  EMPTY,
   ENVIRONMENT_INITIALIZER,
   ElementRef,
-  EmptyError,
   EnvironmentInjector,
   EventEmitter,
   HostAttributeToken,
@@ -38,59 +38,30 @@ import {
   NgModule,
   NgModuleFactory$1,
   NgZone,
-  Observable,
   Optional,
   Output,
   PendingTasksInternal,
   Renderer2,
   RuntimeError,
   SkipSelf,
-  Subject,
-  Subscription,
   Version,
   ViewContainerRef,
   afterNextRender,
   booleanAttribute,
-  catchError,
-  combineLatest,
-  concat,
-  concatMap,
   createEnvironmentInjector,
-  defaultIfEmpty,
-  defer,
-  filter,
-  finalize,
-  first,
-  from,
   inject,
   input,
   isInjectable,
   isNgModule,
-  isObservable,
   isPromise,
   isStandalone,
-  last,
   makeEnvironmentProviders,
-  map,
-  mergeAll,
-  mergeMap,
-  of,
   performanceMarkFeature,
-  pipe,
   provideAppInitializer,
-  refCount,
   reflectComponentType,
   runInInjectionContext,
-  scan,
   setClassMetadata,
   signal,
-  startWith,
-  switchMap,
-  take,
-  takeLast,
-  takeUntil,
-  tap,
-  throwError,
   untracked,
   ɵɵNgOnChangesFeature,
   ɵɵattribute,
@@ -110,14 +81,49 @@ import {
   ɵɵloadQuery,
   ɵɵqueryRefresh,
   ɵɵsanitizeUrlOrResourceUrl
-} from "./chunk-5D2FILIF.js";
+} from "./chunk-IWNLVX2U.js";
 import {
-  __async,
+  BehaviorSubject,
+  ConnectableObservable,
+  EMPTY,
+  EmptyError,
+  Observable,
+  Subject,
+  Subscription,
+  catchError,
+  combineLatest,
+  concat,
+  concatMap,
+  defaultIfEmpty,
+  defer,
+  filter,
+  finalize,
+  first,
+  from,
+  isObservable,
+  last,
+  map,
+  mergeAll,
+  mergeMap,
+  of,
+  pipe,
+  refCount,
+  scan,
+  startWith,
+  switchMap,
+  take,
+  takeLast,
+  takeUntil,
+  tap,
+  throwError
+} from "./chunk-LVZPAC5H.js";
+import "./chunk-F4JO3ZK7.js";
+import {
   __spreadProps,
   __spreadValues
-} from "./chunk-WDMUDEB6.js";
+} from "./chunk-GOMI4DH3.js";
 
-// node_modules/@angular/router/fesm2022/router2.mjs
+// ../../node_modules/@angular/router/fesm2022/router2.mjs
 var PRIMARY_OUTLET = "primary";
 var RouteTitleKey = Symbol("RouteTitle");
 var ParamsAsMap = class {
@@ -4781,7 +4787,7 @@ function validateCommands(commands) {
   }
 }
 
-// node_modules/@angular/router/fesm2022/router_module.mjs
+// ../../node_modules/@angular/router/fesm2022/router_module.mjs
 var RouterLink = class _RouterLink {
   router;
   route;
@@ -5535,8 +5541,8 @@ var RouterScroller = class _RouterScroller {
     });
   }
   scheduleScrollEvent(routerEvent, anchor) {
-    this.zone.runOutsideAngular(() => __async(this, null, function* () {
-      yield new Promise((resolve) => {
+    this.zone.runOutsideAngular(async () => {
+      await new Promise((resolve) => {
         setTimeout(resolve);
         if (typeof requestAnimationFrame !== "undefined") {
           requestAnimationFrame(resolve);
@@ -5545,7 +5551,7 @@ var RouterScroller = class _RouterScroller {
       this.zone.run(() => {
         this.transitions.events.next(new Scroll(routerEvent, this.lastSource === "popstate" ? this.store[this.restoredId] : null, anchor));
       });
-    }));
+    });
   }
   /** @docs-private */
   ngOnDestroy() {
@@ -5949,7 +5955,7 @@ function provideRouterInitializer() {
   ];
 }
 
-// node_modules/@angular/router/fesm2022/router.mjs
+// ../../node_modules/@angular/router/fesm2022/router.mjs
 function mapToCanMatch(providers) {
   return providers.map((provider) => (...params) => inject(provider).canMatch(...params));
 }

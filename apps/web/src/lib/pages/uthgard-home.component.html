@@ -1,0 +1,70 @@
+<h2>Recent RvR (last hour)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Realm</th>
+      <th>RP +</th>
+      <th>When</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr *ngFor="let e of rvr()">
+      <td>{{ e.name }}</td>
+      <td>{{ e.realm }}</td>
+      <td>{{ e.rpDelta }}</td>
+      <td>{{ e.at | date : "short" }}</td>
+    </tr>
+  </tbody>
+</table>
+test
+<h2>Recent PvE (last hour)</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Name</th>
+      <th>Realm</th>
+      <th>Event</th>
+      <th>When</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr *ngFor="let e of pve()">
+      <td>{{ e.name }}</td>
+      <td>{{ e.realm }}</td>
+      <td>{{ e.event }} {{ e.level ? "L" + e.level : "" }}</td>
+      <td>{{ e.at | date : "short" }}</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Last Week RP</h2>
+<table *ngIf="board() as b">
+  <caption>
+    {{
+      b.weekStart
+    }}
+    →
+    {{
+      b.weekEnd
+    }}
+  </caption>
+  <thead>
+    <tr>
+      <th>#</th>
+      <th>Name</th>
+      <th>Realm</th>
+      <th>Last Week RP</th>
+      <th>Total RP</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr *ngFor="let r of b.rows; let i = index">
+      <td>{{ i + 1 }}</td>
+      <td>{{ r.name }}</td>
+      <td>{{ r.realm }}</td>
+      <td>{{ r.lastWeekRP | number }}</td>
+      <td>{{ r.totalRP | number }}</td>
+    </tr>
+  </tbody>
+</table>
