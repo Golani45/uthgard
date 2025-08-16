@@ -22,9 +22,8 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 20 }
 
-      # install Angular app deps
-      - name: Install web deps
-        working-directory: apps/web
+      # install all workspace deps
+      - name: Install dependencies
         run: npm ci
 
       # build Angular
