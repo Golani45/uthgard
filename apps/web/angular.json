@@ -21,7 +21,7 @@
               "src/assets",
               { "glob": "**/*", "input": "../../data/public", "output": "data" }
             ],
-            "styles": ["./node_modules/primeflex/primeflex.css"],
+            "styles": ["primeflex/primeflex.css"],
             "inlineStyleLanguage": "scss"
           },
           "configurations": {
