@@ -28,6 +28,13 @@ type Event = {
   raw?: string;
 };
 
+// Discord embed color per realm (integer, not hex string)
+const REALM_COLOR: Record<Realm, number> = {
+  Albion: 0x3b82f6, // blue
+  Midgard: 0xef4444, // red
+  Hibernia: 0x22c55e, // green
+};
+
 // Warmap types
 interface WarmapData {
   updatedAt: string;
@@ -287,35 +294,57 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   };
 }
 
+const EMBED_FOOTER = { text: "Uthgard Herald watch" };
+// If you have a small square avatar to show on the webhook bot:
+const WEBHOOK_USERNAME = "Uthgard Herald";
+const WEBHOOK_AVATAR = ""; // e.g. https://your-cdn/avatar.png
+
+// send once per unique event (keepId + timestamp)
 // send once per unique event (keepId + timestamp)
 async function notifyDiscord(
   env: Environment,
-  e: {
-    keepId: string;
-    keepName: string;
-    at: string;
-    owner?: string;
-  }
+  e: { keepId: string; at: string; keep: Keep }
 ) {
   const url = env.DISCORD_WEBHOOK_URL;
   if (!url) return;
 
-  const key = `alert:under:${e.keepId}:${e.at}`; // unique per event
-  const already = await env.WARMAP.get(key);
-  if (already) return;
+  // de-dupe per event (no cooldown—just “send once per event”)
+  const key = `alert:under:${e.keepId}:${e.at}`;
+  if (await env.WARMAP.get(key)) return;
 
-  // basic message (you can switch to embeds later)
-  const content = `⚔️ **${e.keepName}** is **under attack**! (at ${new Date(
-    e.at
-  ).toLocaleString()})`;
+  const k = e.keep;
 
+  // Build a nice embed
+  const embed: any = {
+    title: `⚔️ ${k.name} is under attack!`,
+    color: REALM_COLOR[k.owner],
+    fields: [
+      { name: "Owner", value: k.owner, inline: true },
+      { name: "Level", value: String(k.level ?? "—"), inline: true },
+      { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
+    ],
+    timestamp: new Date(e.at).toISOString(),
+    footer: EMBED_FOOTER,
+  };
+
+  // If we have an emblem, add it as a thumbnail (herald link already absolute)
+  if (k.emblem) embed.thumbnail = { url: k.emblem };
+
+  // If you have a public warmap URL, add a “View map” link in the description:
+  // embed.description = "[Open Warmap](https://golani45.github.io/uthgard/)";
+
+  // Send it
   await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ content }),
+    body: JSON.stringify({
+      username: WEBHOOK_USERNAME || undefined,
+      avatar_url: WEBHOOK_AVATAR || undefined,
+      embeds: [embed],
+    }),
   });
 
-  // remember we sent it (dedupe only; not a time-based cooldown)
+  // Remember we sent this exact event
   await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 }); // 6h
 }
 
@@ -375,21 +404,27 @@ router.get("/favicon.ico", () => new Response("", { status: 204 }));
 
 async function alertUnderAttacks(
   env: Environment,
-  events: Event[],
+  payload: WarmapData,
   windowMin: number
 ) {
   const windowMs = windowMin * 60_000;
   const now = Date.now();
 
-  const recentUnderAttacks = events.filter(
+  // quick lookup
+  const byId = new Map(payload.keeps.map((k) => [k.id, k]));
+
+  const recentUnderAttacks = payload.events.filter(
     (e) => e.kind === "underAttack" && now - Date.parse(e.at) <= windowMs
   );
 
   for (const e of recentUnderAttacks) {
+    const k = byId.get(e.keepId);
+    if (!k) continue; // safety
+
     await notifyDiscord(env, {
       keepId: e.keepId,
-      keepName: e.keepName,
       at: e.at,
+      keep: k,
     });
   }
 }
@@ -409,8 +444,8 @@ async function updateWarmap(env: Environment): Promise<WarmapData> {
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
   const payload = buildWarmapFromHtml(html, windowMin);
 
-  // 🔔 send alerts for current “under attack” events (deduped by KV)
-  await alertUnderAttacks(env, payload.events, windowMin);
+  // 🔔 send embeds for “under attack” events (deduped by KV)
+  await alertUnderAttacks(env, payload, windowMin);
 
   await env.WARMAP.put("warmap", JSON.stringify(payload));
   return payload;
