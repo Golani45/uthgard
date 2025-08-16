@@ -30,8 +30,8 @@ type Event = {
 
 // Discord embed color per realm (integer, not hex string)
 const REALM_COLOR: Record<Realm, number> = {
-  Albion: 0x3b82f6, // blue
-  Midgard: 0xef4444, // red
+  Albion: 0xef4444, // red
+  Midgard: 0x3b82f6, // blue
   Hibernia: 0x22c55e, // green
 };
 
