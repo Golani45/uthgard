@@ -1,9 +1,9 @@
 import { HttpClient } from "@angular/common/http";
 import { inject, Injectable } from "@angular/core";
 import { Observable } from "rxjs";
-import { environment } from "../../environments/environment";
-import { ActivityFeed } from "../models/activity-feed";
-import { LastWeekBoard } from "../models/last-week-board";
+import { environment } from "src/environments/environment";
+import { ActivityFeed } from "src/lib/models/activity-feed";
+import { LastWeekBoard } from "src/lib/models/last-week-board";
 
 @Injectable({
   providedIn: "root",

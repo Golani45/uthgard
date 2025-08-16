@@ -19,7 +19,7 @@
             "assets": [
               "src/favicon.ico",
               "src/assets",
-              { "glob": "**/*", "input": "../data/public", "output": "data" }
+              { "glob": "**/*", "input": "../../data/public", "output": "data" }
             ],
             "styles": ["./node_modules/primeflex/primeflex.css"],
             "inlineStyleLanguage": "scss"
@@ -28,6 +28,12 @@
             "production": {
               "optimization": true,
               "outputHashing": "all",
+              "fileReplacements": [
+                {
+                  "replace": "src/environments/environment.ts",
+                  "with": "src/environments/environment.prod.ts"
+                }
+              ],
               "budgets": [
                 {
                   "type": "initial",

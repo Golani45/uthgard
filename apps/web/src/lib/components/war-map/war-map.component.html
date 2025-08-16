@@ -1,0 +1,40 @@
+<div class="warmap-shell" [style.max-width]="maxWidth()" style.height="700px">
+  <div class="map" [style.width.px]="width()" (click)="onMapClick($event)">
+    <img class="base" src="assets/maps/frontier-base.png" alt="Frontiers" />
+
+    <!-- markers -->
+    <button
+      *ngFor="let m of markers()"
+      class="marker"
+      [style.left.%]="m.x * 100"
+      [style.top.%]="m.y * 100"
+      [class.alb]="m.realm === 'Albion'"
+      [class.mid]="m.realm === 'Midgard'"
+      [class.hib]="m.realm === 'Hibernia'"
+      [title]="m.title"
+    >
+      <img class="icon" [src]="iconFor(m.realm, m.id)" alt="" />
+      <span class="flame" *ngIf="m.underAttack"></span>
+    </button>
+
+    <!-- Darkness Falls badge -->
+    <div
+      class="df-badge"
+      [class.alb]="dfOwner() === 'Albion'"
+      [class.mid]="dfOwner() === 'Midgard'"
+      [class.hib]="dfOwner() === 'Hibernia'"
+    >
+      DF: {{ dfBadge() }}
+    </div>
+  </div>
+</div>
+
+<!-- simple placement UI -->
+<div *ngIf="editMode" class="mt-2 text-xs">
+  Place ID:
+  <select [(ngModel)]="placingId" name="placingId">
+    <option [ngValue]="null">-- choose --</option>
+    <option *ngFor="let g of geo()" [ngValue]="g.id">{{ g.id }}</option>
+  </select>
+  (click on the map to log coords)
+</div>

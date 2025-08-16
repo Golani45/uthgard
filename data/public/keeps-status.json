@@ -1,0 +1,19 @@
+{
+  "timestamp": "2025-08-15T18:30:00Z",
+  "dfOwner": "Midgard",
+  "keeps": {
+    "caer-benowyc": {
+      "realm": "Albion",
+      "underAttack": false,
+      "lastChanged": "2025-08-15T08:50:00Z"
+    },
+    "glenlock-faste": {
+      "realm": "Midgard",
+      "underAttack": true,
+      "lastChanged": "2025-08-15T18:20:00Z"
+    },
+    "blendrake-faste": { "realm": "Midgard", "underAttack": false },
+    "dun-crauchon": { "realm": "Hibernia", "underAttack": false },
+    "dun-bolg": { "realm": "Hibernia", "underAttack": true }
+  }
+}

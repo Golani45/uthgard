@@ -1,0 +1,110 @@
+.warmap-shell {
+  display: grid;
+  place-items: center;
+}
+
+.map {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 1600 / 900; // adjust to match your frontier-base.png
+  background: #0b0b0b;
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+
+  .base {
+    position: absolute;
+    inset: 0;
+    width: 74%;
+    height: 100%;
+    justify-self: center;
+    object-fit: cover;
+    filter: contrast(1.02) saturate(1.05);
+    pointer-events: none;
+    user-select: none;
+  }
+}
+
+/* Keep markers */
+.marker {
+  position: absolute;
+  transform: translate(-50%, -100%); // anchor bottom-center
+  background: transparent;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  transition: transform 0.1s ease-out;
+  outline: none;
+
+  .icon {
+    width: 28px;
+    height: 28px;
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, 0.6));
+  }
+
+  &:hover {
+    transform: translate(-50%, -105%) scale(1.05);
+  }
+
+  &.alb .icon {
+  }
+  &.mid .icon {
+  }
+  &.hib .icon {
+  }
+}
+
+/* Attack flame */
+.flame {
+  position: absolute;
+  left: 50%;
+  top: -6px;
+  width: 14px;
+  height: 14px;
+  transform: translateX(-50%);
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 50% 40%,
+    #ffed9a 0,
+    #ff8a00 45%,
+    rgba(255, 0, 0, 0.6) 70%,
+    transparent 71%
+  );
+  box-shadow: 0 0 10px 3px rgba(255, 120, 0, 0.6);
+  animation: pulse 0.8s infinite ease-in-out;
+}
+
+@keyframes pulse {
+  0%,
+  100% {
+    transform: translateX(-50%) scale(0.8);
+    opacity: 0.75;
+  }
+  50% {
+    transform: translateX(-50%) scale(1.15);
+    opacity: 1;
+  }
+}
+
+/* Darkness Falls badge */
+.df-badge {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+  color: #111;
+  background: #ddd;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.3);
+  &.alb {
+    background: #f1c27d;
+  }
+  &.mid {
+    background: #9ad0f5;
+  }
+  &.hib {
+    background: #b7e3a3;
+  }
+}

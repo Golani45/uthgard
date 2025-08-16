@@ -1,7 +1,32 @@
 [
-  { "id": "caer-benozyc", "x": 0.18, "y": 0.74 },
-  { "id": "glenlock-faste", "x": 0.39, "y": 0.75 },
-  { "id": "blendrake-faste", "x": 0.48, "y": 0.62 },
-  { "id": "dun-crauchon", "x": 0.09, "y": 0.35 },
-  { "id": "dun-bolg", "x": 0.24, "y": 0.16 }
+  { "id": "caer-benowyc", "x": 0.586, "y": 0.557 },
+  { "id": "caer-berkstead", "x": 0.58, "y": 0.797 },
+  { "id": "caer-erasleigh", "x": 0.591, "y": 0.675 },
+  { "id": "caer-renaris", "x": 0.631, "y": 0.878 },
+  { "id": "caer-boldiam", "x": 0.641, "y": 0.734 },
+  { "id": "caer-sursbrooke", "x": 0.545, "y": 0.764 },
+  { "id": "caer-hurbury", "x": 0.471, "y": 0.807 },
+
+  { "id": "glenlock-faste", "x": 0.627, "y": 0.241 },
+  { "id": "bledmeer-faste", "x": 0.467, "y": 0.257 },
+  { "id": "nottmoor-faste", "x": 0.554, "y": 0.264 },
+  { "id": "blendrake-faste", "x": 0.583, "y": 0.205 },
+  { "id": "hlidskialf-faste", "x": 0.598, "y": 0.3 },
+  { "id": "arvakr-faste", "x": 0.653, "y": 0.299 },
+  { "id": "fensalir-faste", "x": 0.656, "y": 0.16 },
+
+  { "id": "dun-crauchon", "x": 0.375, "y": 0.472 },
+  { "id": "dun-bolg", "x": 0.3, "y": 0.55 },
+  { "id": "dun-nged", "x": 0.257, "y": 0.623 },
+  { "id": "dun-ailinne", "x": 0.222, "y": 0.569 },
+  { "id": "dun-crimthainn", "x": 0.345, "y": 0.616 },
+  { "id": "dun-scathaig", "x": 0.244, "y": 0.76 },
+  { "id": "dun-da-behnn", "x": 0.301, "y": 0.693 },
+
+  { "id": "alb-strength-relic", "x": 0.654, "y": 0.832 },
+  { "id": "alb-power-relic", "x": 0.396, "y": 0.849 },
+  { "id": "mid-strength-relic", "x": 0.646, "y": 0.028 },
+  { "id": "mid-power-relic", "x": 0.668, "y": 0.41 },
+  { "id": "hib-strength-relic", "x": 0.217, "y": 0.472 },
+  { "id": "hib-power-relic", "x": 0.217, "y": 0.472 }
 ]

@@ -32,6 +32,7 @@ interface WarmapData {
   updatedAt: string;
   keeps: Keep[];
   events: Event[];
+  dfOwner: Realm;
 }
 
 type Realm = "Albion" | "Midgard" | "Hibernia";
@@ -98,6 +99,16 @@ function parseRelative(s: string): { ms: number; bucket: string } {
   return { ms, bucket: `${n}${u}` };
 }
 
+function parseDfOwner(doc: ReturnType<typeof parse>): Realm {
+  // Be liberal: look for any image in the DF panel and infer by filename
+  const img = doc.querySelector('img[src*="df"], img[alt*="Darkness Falls" i]');
+  const src = img?.getAttribute("src")?.toLowerCase() ?? "";
+  if (src.includes("alb")) return "Albion";
+  if (src.includes("mid")) return "Midgard";
+  if (src.includes("hib")) return "Hibernia";
+  return "Midgard";
+}
+
 function relToIsoBucketed(
   s: string,
   bucketCounts: Map<string, number>,
@@ -112,31 +123,28 @@ function relToIsoBucketed(
 
 function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   const doc = parse(html);
+  const dfOwner = parseDfOwner(doc); // ← compute once
 
-  // --- 1) Keeps + owner + level/emblem/claimedBy from the header ---
+  // --- 1) Keeps from headers -------------------------------------------------
   const keeps: Keep[] = [];
   const keepDivs = doc.querySelectorAll("div.keepinfo");
 
   for (const div of keepDivs) {
-    // name
     const name =
       div.querySelector("strong")?.text.trim() ||
       div.getAttribute("id")?.replace(/_/g, " ") ||
       "Unknown";
 
-    // owner from class keepinfo_{alb|mid|hib}
     const classes = (div.getAttribute("class") || "").toLowerCase();
     const realmKey =
       classes.match(/keepinfo_(alb|mid|hib|albion|midgard|hibernia)/)?.[1] ||
       "alb";
     const owner = ownerMap[realmKey] ?? "Albion";
 
-    // level e.g. "<small>(Level 8 keep)</small>"
     const levelText = div.querySelector("small")?.text ?? "";
     const levelMatch = levelText.match(/level\s+(\d+)/i);
     const level = levelMatch ? Number(levelMatch[1]) : null;
 
-    // emblem image near header (alt contains "Emblem" or src contains "emblem")
     const emblemSrc =
       div.querySelector('img[alt*="emblem" i]')?.getAttribute("src") ??
       div.querySelector('img[src*="emblem"]')?.getAttribute("src") ??
@@ -145,7 +153,6 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
       ? new URL(emblemSrc, "https://herald.uthgard.net/").toString()
       : null;
 
-    // claimedBy: header cell shows guild as plain text after <br/>
     const headerCell = div.querySelector('td[align="center"]') ?? div;
     let claimedBy: string | null = null;
     if (headerCell) {
@@ -154,7 +161,6 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
         .map((s) => s.trim())
         .filter(Boolean);
 
-      // take the last meaningful line that isn't name/level/emblem
       while (lines.length) {
         const last = lines[lines.length - 1];
         if (
@@ -187,12 +193,11 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   // quick lookup by id
   const byId = new Map(keeps.map((k) => [k.id, k]));
 
-  // --- 2) Events from each keep’s history table ---
-  const events: WarmapData["events"] = [];
+  // --- 2) Events from history tables -----------------------------------------
+  const events: Event[] = [];
   const rows = doc.querySelectorAll("div.keepinfo table.TABLE tr");
 
-  // track how many events we saw in each relative-time "bucket" (e.g., 3h, 2d)
-  const bucketCounts = new Map<string, number>();
+  const bucketCounts = new Map<string, number>(); // spread equal timestamps
 
   for (const tr of rows) {
     const tds = tr.querySelectorAll("td");
@@ -200,8 +205,6 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 
     const text = tds[0].text.replace(/\s+/g, " ").trim();
     const when = tds[tds.length - 1].text.trim();
-
-    // bucketed timestamp (spreads events 1 minute apart within same bucket)
     const at = relToIsoBucketed(when, bucketCounts);
 
     // "X has been captured by the forces of Realm"
@@ -235,9 +238,11 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
       });
       continue;
     }
+
+    // add other patterns as needed...
   }
 
-  // --- 3) Flames from recent under-attack events ---
+  // --- 3) Flag "under attack" within the recent window -----------------------
   const windowMs = attackWindowMin * 60_000;
   const now = Date.now();
   for (const e of events) {
@@ -253,24 +258,38 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 
   // newest first + cap
   events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+
+  // --- 4) Return once, after building everything -----------------------------
   return {
     updatedAt: new Date().toISOString(),
+    dfOwner,
     keeps,
     events: events.slice(0, 50),
   };
 }
 
+async function getOrUpdateWarmap(env: Environment, maxAgeMs = 30_000) {
+  const existing = await env.WARMAP.get<WarmapData>("warmap", "json");
+  if (existing) {
+    const age = Date.now() - Date.parse(existing.updatedAt);
+    if (!Number.isNaN(age) && age < maxAgeMs) return existing;
+  }
+  // Stale or missing → refresh now
+  return await updateWarmap(env);
+}
+
 const router = Router();
 
-router.get("/api/warmap.json", async (_request, environment: Environment) => {
-  const data = await environment.WARMAP.get<WarmapData>("warmap", "json");
-  return createJsonResponse(
-    data ?? {
-      updatedAt: new Date().toISOString(),
-      keeps: [],
-      events: [],
-    }
-  );
+router.get("/api/warmap.json", async (_req, env: Environment) => {
+  try {
+    const data = await getOrUpdateWarmap(env, 30_000);
+    return createJsonResponse(data);
+  } catch (e: any) {
+    return createJsonResponse(
+      { ok: false, error: String(e?.message ?? e) },
+      502
+    );
+  }
 });
 
 router.post("/admin/kv-test", async (_request, environment: Environment) => {
@@ -286,33 +305,15 @@ router.post("/admin/kv-test", async (_request, environment: Environment) => {
   return new Response("ok");
 });
 
-router.post("/admin/update", async (_request, environment: Environment) => {
+router.post("/admin/update", async (_req, env: Environment) => {
   try {
-    const res = await fetch((environment as any).HERALD_WARMAP_URL, {
-      headers: {
-        "user-agent": "UthgardHeraldBot/1.0 (+contact)",
-        "cache-control": "no-cache",
-      },
-      cf: { cacheTtl: 0, cacheEverything: false },
-    });
-    if (!res.ok) {
-      return createJsonResponse(
-        { ok: false, error: `Herald ${res.status}` },
-        502
-      );
-    }
-
-    const html = await res.text();
-    const payload = buildWarmapFromHtml(
-      html,
-      Number((environment as any).ATTACK_WINDOW_MIN ?? "7")
-    );
-
-    await environment.WARMAP.put("warmap", JSON.stringify(payload));
+    const payload = await updateWarmap(env);
     return createJsonResponse({ ok: true, updatedAt: payload.updatedAt });
-  } catch (err) {
-    console.error("update error:", err);
-    return createJsonResponse({ ok: false, error: "update failed" }, 500);
+  } catch (e: any) {
+    return createJsonResponse(
+      { ok: false, error: String(e?.message ?? e) },
+      502
+    );
   }
 });
 
@@ -321,22 +322,38 @@ router.all("*", () => new Response("Not found", { status: 404 }));
 router.get("/", () => new Response("OK"));
 router.get("/favicon.ico", () => new Response("", { status: 204 }));
 
+async function updateWarmap(env: Environment): Promise<WarmapData> {
+  const res = await fetch((env as any).HERALD_WARMAP_URL, {
+    headers: {
+      "user-agent": "UthgardHeraldBot/1.0 (+contact)",
+      "cache-control": "no-cache",
+    },
+    cf: { cacheTtl: 0, cacheEverything: false },
+  });
+  if (!res.ok) throw new Error(`Herald ${res.status}`);
+
+  const html = await res.text();
+  const payload = buildWarmapFromHtml(
+    html,
+    Number((env as any).ATTACK_WINDOW_MIN ?? "7")
+  );
+
+  await env.WARMAP.put("warmap", JSON.stringify(payload));
+  return payload;
+}
+
 export default {
-  fetch: (
-    request: Request,
-    environment: Environment,
-    context: ExecutionContext
-  ) =>
-    router.handle(request, environment, context).catch((err: unknown) => {
+  fetch: (req: Request, env: Environment, ctx: ExecutionContext) =>
+    router.handle(req, env, ctx).catch((err) => {
       console.error("Unhandled error:", err);
       return new Response("Internal Server Error", { status: 500 });
     }),
-  scheduled: async (_event: ScheduledEvent, environment: Environment) => {
-    const payload: WarmapData = {
-      updatedAt: new Date().toISOString(),
-      keeps: [],
-      events: [],
-    };
-    await environment.WARMAP.put("warmap", JSON.stringify(payload));
+
+  scheduled: async (_evt: ScheduledEvent, env: Environment) => {
+    try {
+      await updateWarmap(env); // <— no more “empty KV” writes
+    } catch (err) {
+      console.error("cron update failed:", err);
+    }
   },
 };

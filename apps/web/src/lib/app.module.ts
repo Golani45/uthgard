@@ -9,6 +9,7 @@ import { AppRoutingModule } from "./app-routing.module";
 import { AppComponent } from "./app/app.component";
 import { UthgardHomePageComponent } from "./pages/uthgard-home.component";
 import { HttpClient } from "@angular/common/http";
+import { WarmapComponent } from "./components/war-map/war-map.component";
 
 @NgModule({
   imports: [
@@ -21,7 +22,7 @@ import { HttpClient } from "@angular/common/http";
     CommonModule,
     TableModule,
   ],
-  declarations: [UthgardHomePageComponent, AppComponent],
+  declarations: [UthgardHomePageComponent, AppComponent, WarmapComponent],
   providers: [DatePipe, DecimalPipe],
   bootstrap: [AppComponent],
 })

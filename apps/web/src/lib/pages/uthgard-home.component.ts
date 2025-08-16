@@ -1,18 +1,20 @@
 import { Component, OnInit } from "@angular/core";
 import { AcitivityEvent } from "../models/activity-event";
 import { LastWeekBoard } from "../models/last-week-board";
-import { UthgardService } from "../services/uthgard.service";
 import { catchError, combineLatest, Subscription } from "rxjs";
 import { CommonModule } from "@angular/common";
 import { HttpClient } from "@angular/common/http";
 import { TableModule } from "primeng/table";
+import { UthgardService } from "../services/uthgard/uthgard.service";
+import { WarMapComponent } from "../../../../web/src/lib/components/war-map/war-map.component";
 
 /**
  * Uthgard home page
  */
 @Component({
   selector: "ac-uthgard-home",
-  imports: [CommonModule, TableModule],
+  standalone: true,
+  imports: [CommonModule, TableModule, WarMapComponent],
   templateUrl: "./uthgard-home.component.html",
   styleUrls: ["./uthgard-home.component.scss"],
 })
@@ -59,8 +61,8 @@ export class UthgardHomePageComponent implements OnInit {
     this.subscriptions.push(
       combineLatest([getRvr, getPve, getLastWeek]).subscribe(
         ([rvr, pve, lastWeek]) => {
-          this.rvr = rvr.events ?? [];
-          this.pve = pve.events ?? [];
+          this.rvr = rvr?.events ?? [];
+          this.pve = pve?.events ?? [];
           this.board = lastWeek;
         }
       )

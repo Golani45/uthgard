@@ -1,23 +1,15 @@
 name = "uthgard-herald"
 main = "src/index.ts"
-compatibility_date = "2025-08-10"
+compatibility_date = "2025-08-16"
 
-# Bind KV
 kv_namespaces = [
-  # replace the id/preview_id with the ones Wrangler printed earlier
-  { binding = "WARMAP", id = "XXXX", preview_id = "YYYY" }
+  { binding = "WARMAP", id = "f485baf327a84b978a15bf681460b72d", preview_id = "b9c02fba4fb04f5cbe35977b77a6a0a3" }
 ]
 
 [triggers]
-# every 2 minutes
-crons = ["*/2 * * * *"]
+crons = ["*/1 * * * *"]
 
 [vars]
-# The warmap view (map of keeps/relics)
 HERALD_WARMAP_URL = "https://herald.uthgard.net/herald.php?view=index"
-
-# How long to consider a keep "under attack" after last seen
 ATTACK_WINDOW_MIN = "7"
-
-# Max number of events to keep in history
 MAX_EVENTS = "50"
