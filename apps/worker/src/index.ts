@@ -301,24 +301,24 @@ const WEBHOOK_AVATAR = ""; // e.g. https://your-cdn/avatar.png
 
 // send once per unique event (keepId + timestamp)
 // send once per unique event (keepId + timestamp)
+// return true if Discord accepted the message
 async function notifyDiscord(
   env: Environment,
   e: { keepId: string; at: string; keep: Keep }
-) {
+): Promise<boolean> {
   const url = env.DISCORD_WEBHOOK_URL;
   if (!url) {
     console.log("discord: missing DISCORD_WEBHOOK_URL");
-    return;
+    return false;
   }
 
-  const key = `alert:under:${e.keepId}:${e.at}`; // event-level de-dupe
+  const key = `alert:under:${e.keepId}:${e.at}`; // event-level dedupe
   if (await env.WARMAP.get(key)) {
-    console.log("discord: dedupe hit", key);
-    return;
+    console.log("discord: event dedupe", key);
+    return false;
   }
 
   const k = e.keep;
-
   const embed: any = {
     title: `⚔️ ${k.name} is under attack!`,
     color: REALM_COLOR[k.owner],
@@ -329,23 +329,25 @@ async function notifyDiscord(
     ],
     timestamp: new Date(e.at).toISOString(),
     footer: { text: "Uthgard Herald watch" },
+    ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
   };
-  if (k.emblem) embed.thumbnail = { url: k.emblem };
 
   const resp = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({ embeds: [embed], username: "Uthgard Herald" }),
+    body: JSON.stringify({ username: "Uthgard Herald", embeds: [embed] }),
   });
 
   if (!resp.ok) {
     const t = await resp.text().catch(() => "");
     console.log("discord: webhook failed", resp.status, t);
-  } else {
-    console.log("discord: webhook ok", resp.status);
+    return false;
   }
 
+  // Discord returns 204 on success
   await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 });
+  console.log("discord: webhook ok", resp.status, e.keepId, e.at);
+  return true;
 }
 
 async function getOrUpdateWarmap(env: Environment, maxAgeMs = 30_000) {
@@ -449,20 +451,28 @@ async function alertUnderAttacks(
   // 2) Header-only alerts (no recent event row)
   for (const k of payload.keeps) {
     if (!k.underAttack) continue;
-    if (alertedFromEvent.has(k.id)) continue; // already sent via event
+    if (alertedFromEvent.has(k.id)) continue;
 
-    // de-dupe header alerts per keep for the attack window
-    const headerKey = `alert:under:header:${k.id}`;
-    const seen = await env.WARMAP.get(headerKey);
-    if (seen) continue;
+    // (Optional) minute bucket so re-alerts can happen if it stays on fire a long time
+    const minuteBucket = Math.floor(Date.parse(payload.updatedAt) / 60000);
+    const headerKey = `alert:under:header:${k.id}:${minuteBucket}`;
 
-    await notifyDiscord(env, {
+    if (await env.WARMAP.get(headerKey)) {
+      console.log("header dedupe", headerKey);
+      continue;
+    }
+
+    const sent = await notifyDiscord(env, {
       keepId: k.id,
-      at: payload.updatedAt, // use current scrape time
+      at: payload.updatedAt,
       keep: k,
     });
 
-    await env.WARMAP.put(headerKey, "1", { expirationTtl: windowMin * 60 });
+    if (sent) {
+      await env.WARMAP.put(headerKey, "1", {
+        expirationTtl: Number(env.ATTACK_WINDOW_MIN ?? "7") * 60,
+      });
+    }
   }
 }
 
