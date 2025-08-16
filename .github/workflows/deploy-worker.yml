@@ -29,7 +29,7 @@ jobs:
       - name: Publish with Wrangler
         uses: cloudflare/wrangler-action@v3
         with:
-          apiToken: ${{ CF_API_TOKEN }}
-          accountId: ${{ CF_ACCOUNT_ID }}
-          workingDirectory: apps/worker
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          workingDireActory: apps/worker
           command: deploy
