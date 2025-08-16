@@ -1,3 +1,4 @@
+# .github/workflows/deploy.yml
 name: Deploy web
 
 on:
@@ -26,29 +27,39 @@ jobs:
           cache: npm
           cache-dependency-path: apps/web/package-lock.json
 
-      # install & build (in apps/web)
+      # Install and build IN apps/web
       - name: Install deps (web)
         working-directory: apps/web
         run: npm ci
 
       - name: Build (prod)
         working-directory: apps/web
-        run: npm run build:prod
+        run: npm run build:prod # => ng build --configuration production --base-href /uthgard/
 
-      # copy JSON into the built site so it’s served at /uthgard/data/...
+      # Figure out where index.html landed
+      - name: Detect dist dir
+        run: |
+          if [ -f apps/web/dist/web/browser/index.html ]; then
+            echo "DIST=apps/web/dist/web/browser" >> $GITHUB_ENV
+          elif [ -f apps/web/dist/web/index.html ]; then
+            echo "DIST=apps/web/dist/web" >> $GITHUB_ENV
+          else
+            echo "index.html not found. Dist tree:"; ls -R apps/web/dist || true
+            exit 1
+          fi
+
       - name: Copy data JSON
         run: |
-          mkdir -p apps/web/dist/web/browser/data
-          cp -r data/public/* apps/web/dist/web/browser/data/
+          mkdir -p "$DIST/data"
+          cp -r data/public/* "$DIST/data/"
 
-      # SPA fallback: /uthgard/anything -> index.html
       - name: Add SPA 404 fallback
-        run: cp apps/web/dist/web/browser/index.html apps/web/dist/web/browser/404.html
+        run: cp "$DIST/index.html" "$DIST/404.html"
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: apps/web/dist/web/browser
+          path: ${{ env.DIST }}
 
   deploy:
     needs: build
