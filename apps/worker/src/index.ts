@@ -6,6 +6,7 @@ interface Environment {
   WARMAP: KVNamespace;
   HERALD_WARMAP_URL: string;
   ATTACK_WINDOW_MIN?: string;
+  DISCORD_WEBHOOK_URL?: string;
 }
 
 type Event = {
@@ -286,6 +287,38 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   };
 }
 
+// send once per unique event (keepId + timestamp)
+async function notifyDiscord(
+  env: Environment,
+  e: {
+    keepId: string;
+    keepName: string;
+    at: string;
+    owner?: string;
+  }
+) {
+  const url = env.DISCORD_WEBHOOK_URL;
+  if (!url) return;
+
+  const key = `alert:under:${e.keepId}:${e.at}`; // unique per event
+  const already = await env.WARMAP.get(key);
+  if (already) return;
+
+  // basic message (you can switch to embeds later)
+  const content = `⚔️ **${e.keepName}** is **under attack**! (at ${new Date(
+    e.at
+  ).toLocaleString()})`;
+
+  await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ content }),
+  });
+
+  // remember we sent it (dedupe only; not a time-based cooldown)
+  await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 }); // 6h
+}
+
 async function getOrUpdateWarmap(env: Environment, maxAgeMs = 30_000) {
   const existing = await env.WARMAP.get<WarmapData>("warmap", "json");
   if (existing) {
@@ -340,8 +373,29 @@ router.all("*", () => new Response("Not found", { status: 404 }));
 router.get("/", () => new Response("OK"));
 router.get("/favicon.ico", () => new Response("", { status: 204 }));
 
+async function alertUnderAttacks(
+  env: Environment,
+  events: Event[],
+  windowMin: number
+) {
+  const windowMs = windowMin * 60_000;
+  const now = Date.now();
+
+  const recentUnderAttacks = events.filter(
+    (e) => e.kind === "underAttack" && now - Date.parse(e.at) <= windowMs
+  );
+
+  for (const e of recentUnderAttacks) {
+    await notifyDiscord(env, {
+      keepId: e.keepId,
+      keepName: e.keepName,
+      at: e.at,
+    });
+  }
+}
+
 async function updateWarmap(env: Environment): Promise<WarmapData> {
-  const res = await fetch((env as any).HERALD_WARMAP_URL, {
+  const res = await fetch(env.HERALD_WARMAP_URL as string, {
     headers: {
       "user-agent": "UthgardHeraldBot/1.0 (+contact)",
       "cache-control": "no-cache",
@@ -351,15 +405,16 @@ async function updateWarmap(env: Environment): Promise<WarmapData> {
   if (!res.ok) throw new Error(`Herald ${res.status}`);
 
   const html = await res.text();
-  const payload = buildWarmapFromHtml(
-    html,
-    Number((env as any).ATTACK_WINDOW_MIN ?? "7")
-  );
+
+  const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
+  const payload = buildWarmapFromHtml(html, windowMin);
+
+  // 🔔 send alerts for current “under attack” events (deduped by KV)
+  await alertUnderAttacks(env, payload.events, windowMin);
 
   await env.WARMAP.put("warmap", JSON.stringify(payload));
   return payload;
 }
-
 export default {
   fetch: (req: Request, env: Environment, ctx: ExecutionContext) =>
     router.handle(req, env, ctx).catch((err) => {
