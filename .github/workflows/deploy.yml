@@ -41,10 +41,12 @@ jobs:
         run: |
           if [ -f apps/web/dist/web/browser/index.html ]; then
             echo "DIST=apps/web/dist/web/browser" >> $GITHUB_ENV
+          elif [ -f apps/web/dist/web/browser/browser/index.html ]; then
+            echo "DIST=apps/web/dist/web/browser/browser" >> $GITHUB_ENV
           elif [ -f apps/web/dist/web/index.html ]; then
             echo "DIST=apps/web/dist/web" >> $GITHUB_ENV
           else
-            echo "index.html not found. Dist tree:"; ls -R apps/web/dist || true
+            echo "index.html not found. Dist:"; ls -R apps/web/dist || true
             exit 1
           fi
 
