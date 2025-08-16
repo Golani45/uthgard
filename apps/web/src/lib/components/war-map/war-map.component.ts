@@ -12,11 +12,15 @@ import { KeepGeo } from "../../models/keep-geo";
 import { Realm } from "../../types/realm";
 import { WarMapService } from "../../services/warmap/war-map.service";
 import { combineLatest, Subscription } from "rxjs";
+import { WarMapStatus } from "src/lib/models/war-map-status";
 
 type Marker = KeepGeo & {
   realm: Realm;
   underAttack: boolean;
   title: string;
+  owned: boolean;
+  claimedBy: string | null;
+  emblem: string | null;
 };
 
 @Component({
@@ -29,7 +33,7 @@ type Marker = KeepGeo & {
 export class WarMapComponent implements OnInit, OnDestroy {
   private svc = inject(WarMapService);
 
-  width = input<number>(1024);
+  width = input<number>(1124);
   maxWidth = input<string>("100%");
 
   editMode = location.search.includes("edit=1");
@@ -56,38 +60,75 @@ export class WarMapComponent implements OnInit, OnDestroy {
     const status$ = this._warMapService.status$;
 
     this.subscriptions.push(
-      combineLatest([geo$, status$]).subscribe(([geo, status]) => {
-        this.geo.set(geo);
-        this.dfOwner.set(status.darknessFallsOwner); // set once
+      combineLatest([geo$, status$]).subscribe(
+        ([geo, status]: [KeepGeo[], WarMapStatus]) => {
+          this.geo.set(geo);
+          this.dfOwner.set(status.darknessFallsOwner);
 
-        const markers = this.geo()
-          .filter((g) => g.x >= 0 && g.y >= 0) // <- no status filter
-          .map((g) => {
-            const st = status.keeps[g.id];
-            const realm = st?.realm ?? "Neutral";
-            const underAttack = !!st?.underAttack;
-            const ts = st?.lastChanged
-              ? new Date(st.lastChanged).toLocaleString()
-              : "";
-            const name = toPrettyName(g.id);
-            return {
-              ...g,
-              realm,
-              underAttack,
-              title: `${name}\nOwner: ${realm}${
-                ts ? `\nLast changed: ${ts}` : ""
-              }`,
-            };
-          });
-        this.markers.set(markers);
-      })
+          const markers = this.geo()
+            .map((g) => {
+              const isRelic = g.type === "relic";
+
+              // Realm: relic keeps from id, normal keeps from status
+              const realm: Realm | undefined = isRelic
+                ? this.idToRealm(g.id) // <- derive from prefix
+                : status.keeps[g.id]?.realm; // <- from worker
+
+              if (!realm) return null; // <- skip unknown/missing
+
+              const st = status.keeps[g.id];
+              const underAttack = !isRelic && !!st?.underAttack;
+
+              // Claimed by (normal keeps only)
+              const claimedBy = !isRelic ? st?.claimedBy : undefined;
+
+              // Optional: show captured enemy relics on hover for that realm
+              const captured = status.relics?.captured?.[realm] ?? []; // array like ["Mid Power", ...]
+              const name = toPrettyName(g.id);
+
+              return {
+                ...g,
+                realm,
+                underAttack,
+                title:
+                  `${name}\nOwner: ${realm}` +
+                  (claimedBy ? `\nClaimed by: ${claimedBy}` : "") +
+                  (isRelic && captured.length
+                    ? `\nCaptured: ${captured.join(", ")}`
+                    : ""),
+              } as Marker;
+            })
+            .filter((m): m is Marker => !!m);
+
+          this.markers.set(markers);
+        }
+      )
     );
   }
 
+  private idToRealm(id: string): Realm {
+    if (id.startsWith("alb-")) return "Albion";
+    if (id.startsWith("mid-")) return "Midgard";
+    return "Hibernia";
+  }
+
   // pass id so you can special-case relics
-  iconFor(realm: Realm, id?: string) {
-    if (id && /relic/.test(id)) return "assets/icons/relic.svg";
-    switch (realm) {
+  iconFor(m: Marker) {
+    if (m.type === "relic") {
+      // Relic keep icon = realm-specific; no neutral
+      switch (m.realm) {
+        case "Albion":
+          return "assets/icons/relics/relic-map-alb.png";
+        case "Midgard":
+          return "assets/icons/relics/relic-map-mid.png";
+        case "Hibernia":
+          return "assets/icons/relics/relic-map-hib.png";
+        default:
+          return "assets/icons/relics/relic-map-mid.png";
+      }
+    }
+    // Keep icon
+    switch (m.realm) {
       case "Albion":
         return "assets/icons/keep-alb.svg";
       case "Midgard":
@@ -95,8 +136,16 @@ export class WarMapComponent implements OnInit, OnDestroy {
       case "Hibernia":
         return "assets/icons/keep-hib.svg";
       default:
-        return "assets/icons/keep-alb.svg";
+        return "assets/icons/keep-mid.svg";
     }
+  }
+
+  private homeRealmForRelic(id: string): Realm | null {
+    if (!/relic/.test(id)) return null;
+    if (id.startsWith("alb-")) return "Albion";
+    if (id.startsWith("mid-")) return "Midgard";
+    if (id.startsWith("hib-")) return "Hibernia";
+    return null;
   }
 
   onMapClick(evt: MouseEvent) {

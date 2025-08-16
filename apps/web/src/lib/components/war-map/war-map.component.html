@@ -13,10 +13,9 @@
       [class.hib]="m.realm === 'Hibernia'"
       [title]="m.title"
     >
-      <img class="icon" [src]="iconFor(m.realm, m.id)" alt="" />
+      <img class="icon" [src]="iconFor(m)" alt="" />
       <span class="flame" *ngIf="m.underAttack"></span>
     </button>
-
     <!-- Darkness Falls badge -->
     <div
       class="df-badge"

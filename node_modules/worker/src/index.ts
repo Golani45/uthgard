@@ -79,6 +79,20 @@ function slug(s: string) {
     .replace(/(^-|-$)/g, "");
 }
 
+function normText(s: string) {
+  // replace NBSP and collapse spaces; drop punctuation that may appear in the banner
+  return s
+    .replace(/\u00A0/g, " ") // NBSP -> space
+    .replace(/[()!?:]/g, "") // remove common punctuation
+    .replace(/\s+/g, " ")
+    .toLowerCase()
+    .trim();
+}
+
+function hasUnderAttack(s: string) {
+  return /\bunder\s+attack\b/.test(normText(s));
+}
+
 function parseRelative(s: string): { ms: number; bucket: string } {
   // normalize: strip () and "ago"
   const t = s
@@ -123,28 +137,30 @@ function relToIsoBucketed(
 
 function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   const doc = parse(html);
-  const dfOwner = parseDfOwner(doc); // ← compute once
 
-  // --- 1) Keeps from headers -------------------------------------------------
   const keeps: Keep[] = [];
   const keepDivs = doc.querySelectorAll("div.keepinfo");
 
   for (const div of keepDivs) {
+    // --- name
     const name =
       div.querySelector("strong")?.text.trim() ||
       div.getAttribute("id")?.replace(/_/g, " ") ||
       "Unknown";
 
+    // --- owner from CSS class
     const classes = (div.getAttribute("class") || "").toLowerCase();
     const realmKey =
       classes.match(/keepinfo_(alb|mid|hib|albion|midgard|hibernia)/)?.[1] ||
       "alb";
     const owner = ownerMap[realmKey] ?? "Albion";
 
+    // --- level
     const levelText = div.querySelector("small")?.text ?? "";
     const levelMatch = levelText.match(/level\s+(\d+)/i);
     const level = levelMatch ? Number(levelMatch[1]) : null;
 
+    // --- emblem URL
     const emblemSrc =
       div.querySelector('img[alt*="emblem" i]')?.getAttribute("src") ??
       div.querySelector('img[src*="emblem"]')?.getAttribute("src") ??
@@ -153,36 +169,46 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
       ? new URL(emblemSrc, "https://herald.uthgard.net/").toString()
       : null;
 
+    // --- header cell text
     const headerCell = div.querySelector('td[align="center"]') ?? div;
-    let claimedBy: string | null = null;
-    if (headerCell) {
-      const lines = headerCell.innerText
-        .split("\n")
-        .map((s) => s.trim())
-        .filter(Boolean);
+    const rawHeader = (headerCell?.innerText ?? "").trim();
 
-      while (lines.length) {
-        const last = lines[lines.length - 1];
-        if (
-          last === name ||
-          /^\(.*level/i.test(last) ||
-          /level/i.test(last) ||
-          /emblem/i.test(last)
-        ) {
-          lines.pop();
-          continue;
-        }
-        claimedBy = last;
-        break;
+    // seed from header banner
+    const headerSaysUnderAttack = hasUnderAttack(rawHeader);
+
+    // scan lines for a guild, skipping name/level/emblem/under attack
+    const lines = rawHeader
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    let claimedBy: string | null = null;
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i];
+      const nline = normText(line);
+
+      if (
+        nline === normText(name) ||
+        /level/.test(nline) ||
+        /emblem/.test(nline) ||
+        hasUnderAttack(line)
+      ) {
+        continue; // ignore non-guild lines
       }
+
+      claimedBy = line.replace(/^claimed\s*by\s*:\s*/i, "").trim();
+      break;
     }
+
+    // safety: if we somehow captured the banner text, drop it
+    if (claimedBy && hasUnderAttack(claimedBy)) claimedBy = null;
 
     keeps.push({
       id: slug(name),
       name,
       type: "keep",
       owner,
-      underAttack: false,
+      underAttack: headerSaysUnderAttack, // seed from header
       level,
       emblem,
       claimedBy,
@@ -190,15 +216,14 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     });
   }
 
-  // quick lookup by id
+  // quick lookup
   const byId = new Map(keeps.map((k) => [k.id, k]));
 
-  // --- 2) Events from history tables -----------------------------------------
-  const events: Event[] = [];
+  // --- events table (your existing code) ---
+  const events: WarmapData["events"] = [];
   const rows = doc.querySelectorAll("div.keepinfo table.TABLE tr");
 
-  const bucketCounts = new Map<string, number>(); // spread equal timestamps
-
+  const bucketCounts = new Map<string, number>();
   for (const tr of rows) {
     const tds = tr.querySelectorAll("td");
     if (tds.length < 2) continue;
@@ -207,7 +232,6 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const when = tds[tds.length - 1].text.trim();
     const at = relToIsoBucketed(when, bucketCounts);
 
-    // "X has been captured by the forces of Realm"
     let m = text.match(
       /^(.+?) has been captured by the forces of (Albion|Midgard|Hibernia)/i
     );
@@ -225,7 +249,6 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
       continue;
     }
 
-    // "X is/was under attack"
     m = text.match(/^(.+?) (?:is|was) under attack/i);
     if (m) {
       const keepName = m[1].trim();
@@ -238,11 +261,9 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
       });
       continue;
     }
-
-    // add other patterns as needed...
   }
 
-  // --- 3) Flag "under attack" within the recent window -----------------------
+  // apply under-attack window to set flames; OR with header flag
   const windowMs = attackWindowMin * 60_000;
   const now = Date.now();
   for (const e of events) {
@@ -251,19 +272,16 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     if (!k) continue;
     const t = Date.parse(e.at);
     if (!Number.isNaN(t) && now - t <= windowMs) {
-      k.underAttack = true;
+      k.underAttack = true; // <-- keep flames even if header didn’t say it
       k.lastEvent = e.at;
     }
   }
 
-  // newest first + cap
   events.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
-
-  // --- 4) Return once, after building everything -----------------------------
   return {
     updatedAt: new Date().toISOString(),
-    dfOwner,
     keeps,
+    dfOwner: parseDfOwner(doc),
     events: events.slice(0, 50),
   };
 }

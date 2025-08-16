@@ -5,4 +5,7 @@ export interface WarMapStatus {
   timestamp: string;
   darknessFallsOwner: Realm;
   keeps: Record<string, KeepStatus>;
+  relics: {
+    captured: Record<Realm, string[]>;
+  };
 }
