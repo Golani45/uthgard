@@ -350,6 +350,31 @@ async function notifyDiscord(
   return true;
 }
 
+async function alertOnUnderAttackTransitions(
+  env: Environment,
+  payload: WarmapData
+) {
+  for (const k of payload.keeps) {
+    const stateKey = `ua:state:${k.id}`; // '1' = currently alerted (under attack), '0' = not
+    const prev = (await env.WARMAP.get(stateKey)) === "1";
+    const curr = !!k.underAttack;
+
+    if (curr && !prev) {
+      // First time we notice this siege -> alert
+      const ok = await notifyDiscord(env, {
+        keepId: k.id,
+        at: payload.updatedAt,
+        keep: k,
+      });
+      if (ok) await env.WARMAP.put(stateKey, "1"); // stick until siege ends
+    } else if (!curr && prev) {
+      // Siege ended -> allow future alerts
+      await env.WARMAP.put(stateKey, "0");
+    }
+    // else: no change -> no alert
+  }
+}
+
 async function getOrUpdateWarmap(env: Environment, maxAgeMs = 30_000) {
   const existing = await env.WARMAP.get<WarmapData>("warmap", "json");
   if (existing) {
@@ -487,16 +512,18 @@ async function updateWarmap(env: Environment): Promise<WarmapData> {
   if (!res.ok) throw new Error(`Herald ${res.status}`);
 
   const html = await res.text();
-
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
+
+  // buildWarmapFromHtml already sets k.underAttack from header OR recent event window
   const payload = buildWarmapFromHtml(html, windowMin);
 
-  // 🔔 send embeds for “under attack” events (deduped by KV)
-  await alertUnderAttacks(env, payload, windowMin);
+  // 🔔 only on state transitions
+  await alertOnUnderAttackTransitions(env, payload);
 
   await env.WARMAP.put("warmap", JSON.stringify(payload));
   return payload;
 }
+
 export default {
   fetch: (req: Request, env: Environment, ctx: ExecutionContext) =>
     router.handle(req, env, ctx).catch((err) => {
