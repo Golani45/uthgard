@@ -306,15 +306,19 @@ async function notifyDiscord(
   e: { keepId: string; at: string; keep: Keep }
 ) {
   const url = env.DISCORD_WEBHOOK_URL;
-  if (!url) return;
+  if (!url) {
+    console.log("discord: missing DISCORD_WEBHOOK_URL");
+    return;
+  }
 
-  // de-dupe per event (no cooldown—just “send once per event”)
-  const key = `alert:under:${e.keepId}:${e.at}`;
-  if (await env.WARMAP.get(key)) return;
+  const key = `alert:under:${e.keepId}:${e.at}`; // event-level de-dupe
+  if (await env.WARMAP.get(key)) {
+    console.log("discord: dedupe hit", key);
+    return;
+  }
 
   const k = e.keep;
 
-  // Build a nice embed
   const embed: any = {
     title: `⚔️ ${k.name} is under attack!`,
     color: REALM_COLOR[k.owner],
@@ -324,28 +328,24 @@ async function notifyDiscord(
       { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
     ],
     timestamp: new Date(e.at).toISOString(),
-    footer: EMBED_FOOTER,
+    footer: { text: "Uthgard Herald watch" },
   };
-
-  // If we have an emblem, add it as a thumbnail (herald link already absolute)
   if (k.emblem) embed.thumbnail = { url: k.emblem };
 
-  // If you have a public warmap URL, add a “View map” link in the description:
-  // embed.description = "[Open Warmap](https://golani45.github.io/uthgard/)";
-
-  // Send it
-  await fetch(url, {
+  const resp = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      username: WEBHOOK_USERNAME || undefined,
-      avatar_url: WEBHOOK_AVATAR || undefined,
-      embeds: [embed],
-    }),
+    body: JSON.stringify({ embeds: [embed], username: "Uthgard Herald" }),
   });
 
-  // Remember we sent this exact event
-  await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 }); // 6h
+  if (!resp.ok) {
+    const t = await resp.text().catch(() => "");
+    console.log("discord: webhook failed", resp.status, t);
+  } else {
+    console.log("discord: webhook ok", resp.status);
+  }
+
+  await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 });
 }
 
 async function getOrUpdateWarmap(env: Environment, maxAgeMs = 30_000) {
@@ -370,6 +370,26 @@ router.get("/api/warmap.json", async (_req, env: Environment) => {
       502
     );
   }
+});
+
+router.get("/admin/test-hook", async (_req, env: Environment) => {
+  const now = new Date().toISOString();
+  await notifyDiscord(env, {
+    keepId: "test-keep",
+    at: now,
+    keep: {
+      id: "test-keep",
+      name: "Test Keep",
+      type: "keep",
+      owner: "Midgard",
+      underAttack: true,
+      level: 10,
+      claimedBy: "Test Guild",
+      claimedAt: null,
+      emblem: null,
+    },
+  });
+  return new Response("sent");
 });
 
 router.post("/admin/kv-test", async (_request, environment: Environment) => {
@@ -413,19 +433,36 @@ async function alertUnderAttacks(
   // quick lookup
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
 
-  const recentUnderAttacks = payload.events.filter(
-    (e) => e.kind === "underAttack" && now - Date.parse(e.at) <= windowMs
-  );
+  // 1) Event-based alerts (what you already had)
+  const alertedFromEvent = new Set<string>();
+  for (const e of payload.events) {
+    if (e.kind !== "underAttack") continue;
+    if (now - Date.parse(e.at) > windowMs) continue;
 
-  for (const e of recentUnderAttacks) {
     const k = byId.get(e.keepId);
-    if (!k) continue; // safety
+    if (!k) continue;
+
+    await notifyDiscord(env, { keepId: e.keepId, at: e.at, keep: k });
+    alertedFromEvent.add(e.keepId);
+  }
+
+  // 2) Header-only alerts (no recent event row)
+  for (const k of payload.keeps) {
+    if (!k.underAttack) continue;
+    if (alertedFromEvent.has(k.id)) continue; // already sent via event
+
+    // de-dupe header alerts per keep for the attack window
+    const headerKey = `alert:under:header:${k.id}`;
+    const seen = await env.WARMAP.get(headerKey);
+    if (seen) continue;
 
     await notifyDiscord(env, {
-      keepId: e.keepId,
-      at: e.at,
+      keepId: k.id,
+      at: payload.updatedAt, // use current scrape time
       keep: k,
     });
+
+    await env.WARMAP.put(headerKey, "1", { expirationTtl: windowMin * 60 });
   }
 }
 
