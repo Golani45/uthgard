@@ -1,0 +1,35 @@
+# .github/workflows/deploy-worker.yml
+name: Deploy worker
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/worker/**"
+      - ".github/workflows/deploy-worker.yml"
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/worker
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/worker/package-lock.json
+
+      - name: Install deps (worker)
+        run: npm ci
+
+      - name: Publish with Wrangler
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ q4INqUW2noqgn5wnXWB9ETxTd5duMX9R28_hwAtE }}
+          accountId: ${{ 7291028fb25fd2e27adb61803ba7c029 }}
+          workingDirectory: apps/worker
+          command: deploy

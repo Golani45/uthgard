@@ -1,43 +1,42 @@
+# .github/workflows/scrape.yml
 name: Daily Scraper
 
 on:
   schedule:
-    - cron: "0 6 * * *" # Runs every day at 6:00 UTC
-  workflow_dispatch: # Allow manual run from GitHub Actions tab
+    - cron: "0 6 * * *" # every day 06:00 UTC
+  workflow_dispatch:
 
 jobs:
   scrape:
     runs-on: ubuntu-latest
-
+    defaults:
+      run:
+        working-directory: scraper
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: scraper/package-lock.json
 
-      - name: Install dependencies
+      - name: Install deps (scraper)
         run: npm ci
 
-      # Build TypeScript to JS
+      # If you transpile TypeScript, keep this. If you run ts-node, remove it.
       - name: Build scraper
-        run: npm run build:scraper
+        run: npm run build # or npm run build:scraper (match your scripts)
 
-      # Run the compiled JS instead of ts-node
       - name: Run scraper
         run: npm run scrape
 
-      # Optional: run aggregation if needed
-      - name: Run aggregation
-        run: npm run aggregate
+      - name: Aggregate (optional)
+        run: npm run aggregate || true
 
-      # in .github/workflows/scrape.yml (after aggregate)
       - name: Commit JSON
         run: |
           git config user.name "bot"
           git config user.email "bot@users.noreply.github.com"
-          git add data/public
+          git add ../data/public
           git commit -m "update data [skip ci]" || echo "no changes"
           git push

@@ -1,3 +1,4 @@
+# .github/workflows/deploy-web.yml
 name: Deploy web
 
 on:
@@ -6,7 +7,7 @@ on:
     paths:
       - "apps/web/**"
       - "data/public/**"
-      - ".github/workflows/deploy.yml"
+      - ".github/workflows/deploy-web.yml"
   workflow_dispatch:
 
 permissions:
@@ -17,25 +18,27 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4 # <-- fix the typo (@v4A -> @v4)
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
 
-      # install all workspace deps
-      - name: Install dependencies
+      - name: Install deps (web)
         run: npm ci
 
-      # build Angular
-      - name: Build web
-        working-directory: apps/web
-        run: npm run build -- --configuration production
+      - name: Build (prod)
+        run: npm run build:prod
 
-      # copy JSON into the built site so it's served at /data/...
-      - name: Copy data
+      - name: Copy data JSON into site
         run: |
-          mkdir -p apps/web/dist/web/browser/data
-          cp -r data/public/* apps/web/dist/web/browser/data/
+          mkdir -p dist/web/browser/data
+          cp -r ../../data/public/* dist/web/browser/data/
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
