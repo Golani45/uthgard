@@ -8,6 +8,7 @@ interface Environment {
   ATTACK_WINDOW_MIN?: string;
   DISCORD_WEBHOOK_URL?: string;
   DISCORD_WEBHOOK_URL_PLAYERS?: string; // player activity
+  DISCORD_WEBHOOK_CAPTURE?: string; // capture activity
   TRACKED_PLAYERS?: string; // ⬅️ stringified JSON
   ACTIVITY_SESSION_MIN?: string; // ⬅️ minutes to treat as one "session" (default 30)
 }
@@ -190,34 +191,42 @@ function headerHasUAImage(node: any): boolean {
 // --- Discord rate-limit gate ---
 const RL_KEY = "discord:cooldown_until"; // ISO timestamp
 
-async function discordCooldownActive(env: Environment): Promise<boolean> {
-  const until = await env.WARMAP.get(RL_KEY);
+async function discordCooldownActive(
+  env: Environment,
+  url: string
+): Promise<boolean> {
+  const key = cooldownKeyFor(url);
+  const until = await env.WARMAP.get(key);
   return until ? Date.now() < Date.parse(until) : false;
 }
 
-async function setDiscordCooldown(env: Environment, secs: number) {
+async function setDiscordCooldown(env: Environment, url: string, secs: number) {
+  const key = cooldownKeyFor(url);
   const until = new Date(Date.now() + secs * 1000).toISOString();
-  await env.WARMAP.put(RL_KEY, until, { expirationTtl: Math.ceil(secs) + 1 });
+  await env.WARMAP.put(key, until, { expirationTtl: Math.ceil(secs) + 1 });
 }
 
 function parseRetryAfter(resp: Response): number {
-  // Discord sends either Retry-After (seconds) or X-RateLimit-Reset-After (seconds)
-  const ra = resp.headers.get("Retry-After");
-  const xra = resp.headers.get("X-RateLimit-Reset-After");
-  const n = Number(ra ?? xra);
-  return Number.isFinite(n) && n > 0 ? n : 2; // default 2s if missing
+  const ra =
+    resp.headers.get("Retry-After") ??
+    resp.headers.get("X-RateLimit-Reset-After");
+  const n = Number(ra);
+  // If Discord/CF omit headers, back off a safe 10s; if CF 1015, they usually send a big number.
+  return Number.isFinite(n) && n > 0 ? n : 10;
 }
 
-async function postToDiscord(env: Environment, body: any): Promise<boolean> {
-  const url = env.DISCORD_WEBHOOK_URL;
+async function postToDiscord(
+  env: Environment,
+  url: string,
+  body: any
+): Promise<boolean> {
   if (!url) {
-    console.log("discord: missing DISCORD_WEBHOOK_URL");
+    console.log("discord: missing webhook url");
     return false;
   }
 
-  // global gate
-  if (await discordCooldownActive(env)) {
-    console.log("discord: global cooldown active — skipping this send");
+  if (await discordCooldownActive(env, url)) {
+    console.log("discord: cooldown active for", cooldownKeyFor(url));
     return false;
   }
 
@@ -229,22 +238,25 @@ async function postToDiscord(env: Environment, body: any): Promise<boolean> {
 
   if (resp.status === 429) {
     const secs = parseRetryAfter(resp);
-    await setDiscordCooldown(env, secs);
+    await setDiscordCooldown(env, url, secs);
+    const txt = await resp.text().catch(() => "");
     console.log(
       "discord 429, backing off secs:",
       secs,
       "code:",
-      await resp.text().catch(() => "")
+      txt.slice(0, 64)
     );
     return false;
   }
 
   if (!resp.ok) {
-    const txt = await resp.text().catch(() => "...");
-    console.log("discord error", resp.status, txt);
+    console.log(
+      "discord error",
+      resp.status,
+      await resp.text().catch(() => "...")
+    );
     return false;
   }
-
   return true;
 }
 
@@ -265,6 +277,24 @@ function mkKeepPartial(id: string, name: string, owner: Realm): Keep {
 }
 function nowIso() {
   return new Date().toISOString();
+}
+
+function capDedupKey(keepId: string, newOwner: Realm, atIso: string) {
+  // minute-bucket to tolerate timing diffs between paths
+  const bucket = new Date(atIso);
+  bucket.setSeconds(0, 0);
+  return `cap:any:${keepId}:${newOwner}:${bucket.toISOString()}`;
+}
+
+// --- Discord rate-limit gate (per webhook) ---
+function cooldownKeyFor(url: string) {
+  // stable key per webhook URL (strip query)
+  try {
+    const u = new URL(url);
+    return `discord:cooldown:${u.pathname}`; // path uniquely identifies the webhook
+  } catch {
+    return `discord:cooldown:${url.slice(-16)}`;
+  }
 }
 
 function relToIsoBucketed(
@@ -436,6 +466,7 @@ async function alertOnOwnershipChanges(
   prev: WarmapData | null
 ) {
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
+
   for (const k of payload.keeps) {
     const ownKey = `own:${k.id}`;
     const prevKV = await env.WARMAP.get(ownKey);
@@ -445,13 +476,27 @@ async function alertOnOwnershipChanges(
       await safePutIfChanged(env, ownKey, k.owner);
       continue;
     }
+
     if (baseline !== k.owner) {
-      const ok = await notifyDiscordCapture(env, {
-        keepName: k.name,
-        newOwner: k.owner,
-        at: payload.updatedAt,
-      });
-      if (ok) await safePutIfChanged(env, ownKey, k.owner);
+      // unified dedupe (shared with event-path)
+      const keepId = k.id; // already a slug in payload
+      const kAny = capDedupKey(keepId, k.owner, payload.updatedAt);
+
+      if (!(await env.WARMAP.get(kAny))) {
+        const ok = await notifyDiscordCapture(env, {
+          keepName: k.name,
+          newOwner: k.owner,
+          at: payload.updatedAt,
+        });
+        if (ok) {
+          await safePutIfChanged(env, kAny, "1", {
+            expirationTtl: 6 * 60 * 60,
+          });
+        }
+      }
+
+      // refresh ownership baseline after alert attempt
+      await safePutIfChanged(env, ownKey, k.owner);
     }
   }
 }
@@ -461,21 +506,17 @@ const EMBED_FOOTER = { text: "Uthgard Herald watch" };
 const WEBHOOK_USERNAME = "Uthgard Herald";
 const WEBHOOK_AVATAR = ""; // e.g. https://your-cdn/avatar.png
 
-// send once per unique event (keepId + timestamp)
-// send once per unique event (keepId + timestamp)
-// return true if Discord accepted the message
+//flame
 async function notifyDiscord(
   env: Environment,
   e: { keepId: string; at: string; keep: Keep }
 ): Promise<boolean> {
+  const url = env.DISCORD_WEBHOOK_URL; // UA/capture webhook
   const key = `alert:under:${e.keepId}:${e.at}`;
-  if (await env.WARMAP.get(key)) {
-    console.log("discord: event dedupe", key);
-    return false;
-  }
+  if (await env.WARMAP.get(key)) return false;
 
   const k = e.keep;
-  const embed: any = {
+  const embed = {
     title: `⚔️ ${k.name} is under attack!`,
     color: REALM_COLOR[k.owner],
     fields: [
@@ -488,37 +529,62 @@ async function notifyDiscord(
     ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
   };
 
-  const ok = await postToDiscord(env, {
+  const ok = await postToDiscord(env, url!, {
     username: "Uthgard Herald",
     embeds: [embed],
   });
-
-  if (ok) {
-    await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
-    console.log("discord sent", e.keepId, e.keep.name, e.at);
-  }
+  if (ok) await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
   return ok;
 }
 
+//keep capture
 async function notifyDiscordCapture(
   env: Environment,
   ev: { keepName: string; newOwner: Realm; at: string }
 ) {
+  const url = env.DISCORD_WEBHOOK_CAPTURE;
   const embed = {
     title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}`,
     color: REALM_COLOR[ev.newOwner],
     timestamp: ev.at,
     footer: { text: "Uthgard Herald watch" },
   };
-
-  const ok = await postToDiscord(env, {
+  return await postToDiscord(env, url!, {
     username: "Uthgard Herald",
     embeds: [embed],
   });
-
-  if (!ok) console.log("discord capture send failed");
-  return ok;
 }
+
+//player
+async function notifyDiscordPlayer(
+  env: Environment,
+  p: { name: string; realm: string },
+  delta: number
+) {
+  const url = env.DISCORD_WEBHOOK_URL_PLAYERS;
+  if (!url) {
+    console.log("no webhook configured for player alerts");
+    return;
+  }
+  const realm = normRealm(p.realm) ?? "Midgard";
+
+  const color = REALM_COLOR[realm];
+  const embed = {
+    title: `🟢 ${p.name} is active`,
+    description: `+${delta.toLocaleString()} RPs gained`,
+    color,
+    fields: [{ name: "Realm", value: realm, inline: true }],
+    timestamp: new Date().toISOString(),
+    footer: { text: "Poofter Saz Watch" },
+  };
+
+  await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "Uthgard Herald", embeds: [embed] }),
+  });
+}
+
 async function alertOnUnderAttackTransitions(
   env: Environment,
   payload: WarmapData
@@ -1081,35 +1147,6 @@ async function safePutIfChanged(
   }
 }
 
-async function notifyDiscordPlayer(
-  env: Environment,
-  p: { name: string; realm: string },
-  delta: number
-) {
-  const url = env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL;
-  if (!url) {
-    console.log("no webhook configured for player alerts");
-    return;
-  }
-  const realm = normRealm(p.realm) ?? "Midgard";
-
-  const color = REALM_COLOR[realm];
-  const embed = {
-    title: `🟢 ${p.name} is active`,
-    description: `+${delta.toLocaleString()} RPs gained`,
-    color,
-    fields: [{ name: "Realm", value: realm, inline: true }],
-    timestamp: new Date().toISOString(),
-    footer: { text: "Poofter Saz Watch" },
-  };
-
-  await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username: "Uthgard Herald", embeds: [embed] }),
-  });
-}
-
 async function safePut(
   env: Environment,
   key: string,
@@ -1136,26 +1173,29 @@ async function alertOnRecentCapturesFromEvents(
   payload: WarmapData
 ) {
   const now = Date.now();
-  const WINDOW_MS = 30 * 60_000; // last 10 minutes
+  const WINDOW_MS = 30 * 60_000; // last 30 minutes
+
   for (const ev of payload.events) {
     if (ev.kind !== "captured") continue;
+
     const atMs = Date.parse(ev.at);
     if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
 
-    const key = `cap:event:${ev.keepId}:${ev.at}`;
-    if (await env.WARMAP.get(key)) continue;
+    // unified dedupe (shared with ownership-change path)
+    const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at);
+    if (await env.WARMAP.get(kAny)) continue;
 
     const ok = await notifyDiscordCapture(env, {
       keepName: ev.keepName,
-      newOwner: ev.newOwner!, // present for captured
+      newOwner: ev.newOwner!, // guaranteed for "captured"
       at: ev.at,
     });
+
     if (ok) {
-      await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
+      await safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 });
     }
   }
 }
-
 async function updateWarmap(
   env: Environment,
   opts?: { silent?: boolean; store?: boolean }
