@@ -109,14 +109,10 @@ function normText(s: string) {
     .trim();
 }
 
-function headerIsUnderAttack(node: any) {
-  const txt = normText(node.innerText ?? "");
-  if (/\bunder\s*attack\b/.test(txt)) return true;
-  // also accept image-based banners
-  const img = node.querySelector?.(
-    'img[src*="attack"], img[src*="flame"], img[alt*="attack" i]'
-  );
-  return !!img;
+function headerIsUnderAttack(node: any): boolean {
+  const text = normText(node?.textContent ?? "");
+  const textSaysUA = /\bunder\s*attack\b/.test(text);
+  return textSaysUA || headerHasUAImage(node);
 }
 
 function hasUnderAttack(s: string) {
@@ -163,19 +159,26 @@ function parseDfOwner(doc: ReturnType<typeof parse>): Realm {
   return "Midgard";
 }
 
-function headerHasUAImage(node: any) {
-  const imgs = node.querySelectorAll?.("img") ?? [];
-  for (const im of imgs) {
-    const src = (im.getAttribute("src") || "").toLowerCase();
-    const alt = (im.getAttribute("alt") || "").toLowerCase();
-    if (
-      /attack|under|flame|alarm|warn|alert|ua/.test(src) ||
-      /attack|under/.test(alt)
-    ) {
-      return true;
-    }
-  }
-  return false;
+function headerHasUAImage(node: any): boolean {
+  if (!node?.querySelector) return false;
+
+  // Be strict: do NOT match plain "under" anywhere.
+  // Only match clear UA banner / flame image patterns.
+  const selector = [
+    // explicit alt text
+    'img[alt*="under attack" i]',
+    // common filenames/patterns seen for UA banners
+    'img[src*="under_attack"]',
+    'img[src*="/ua"]',
+    'img[src*="/ua."]',
+    'img[src$="/ua.png"]',
+    // safe generics (keep but no "under")
+    'img[src*="attack"]',
+    'img[src*="flame"]',
+    'img[src*="onfire"]',
+  ].join(", ");
+
+  return !!node.querySelector(selector);
 }
 
 function relToIsoBucketed(
@@ -228,15 +231,8 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const headerCell = div.querySelector('td[align="center"]') ?? div;
     const rawHeader = (headerCell?.innerText ?? "").trim();
 
-    // seed from header banner
-    const headerText = (
-      headerCell?.innerText ||
-      headerCell?.textContent ||
-      ""
-    ).trim();
-    const headerSaysUnderAttack =
-      hasUnderAttack(headerText) || headerHasUAImage(headerCell);
-    // scan lines for a guild, skipping name/level/emblem/under attack
+    const headerSaysUnderAttack = headerIsUnderAttack(headerCell);
+
     const lines = rawHeader
       .split("\n")
       .map((s) => s.trim())
@@ -282,8 +278,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 
   // --- events table (your existing code) ---
   const events: WarmapData["events"] = [];
-  const rows = doc.querySelectorAll("table.TABLE tr");
-
+  const rows = doc.querySelectorAll("div.keepinfo table.TABLE tr");
   const bucketCounts = new Map<string, number>();
   for (const tr of rows) {
     const tds = tr.querySelectorAll("td");
