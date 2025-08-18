@@ -4,10 +4,11 @@
 /out-tsc
 /bazel-out
 
-# Node
-/node_modules
-npm-debug.log
-yarn-error.log
+# Node deps anywhere in the tree
+**/node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
 
 # Angular cache
 .angular/
