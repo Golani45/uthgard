@@ -469,107 +469,69 @@ async function alertOnUnderAttackTransitions(
 
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
   const ttlSec = windowMin * 240; // UA state "on" TTL
-  const suppressTtl = windowMin * 60; // rising-edge dedupe TTL
+  const suppressTtl = windowMin * 60; // throttle TTL (send once per window)
 
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
-    const startKey = `alert:ua:start:${k.id}`;
+    const throttleKey = `alert:ua:header:${k.id}`; // send-once-per-window throttle
 
     const prevRaw = await env.WARMAP.get(prevKey);
     const prev = !!(prevRaw && prevRaw !== "0");
     const curr = !!k.headerUnderAttack;
 
     if (curr && !prev) {
-      // Rising edge
-      const alreadyStarted = !!(await env.WARMAP.get(startKey));
-      console.log("UA rise:", k.id, k.name, "startKey?", alreadyStarted);
-
-      if (!alreadyStarted) {
+      // Rising edge — set state ON and try to send if not throttled
+      console.log("UA rise:", k.id, k.name);
+      if (!(await env.WARMAP.get(throttleKey))) {
         const ok = await notifyDiscord(env, {
           keepId: k.id,
           at: payload.updatedAt,
           keep: k,
         });
         if (ok) {
-          await safePutIfChanged(env, startKey, String(Date.now()), {
+          await env.WARMAP.put(throttleKey, "1", {
             expirationTtl: suppressTtl,
           });
+          sentHeader++;
         }
+      } else {
+        skippedHeader++;
       }
 
       // Mark UA state "on" (timestamp value, long TTL)
       await safePutIfChanged(env, prevKey, String(Date.now()), {
         expirationTtl: ttlSec,
       });
-      sentHeader++;
     } else if (curr && prev) {
-      // Still flaming. If we somehow missed the first alert, send it now.
-      const alreadyStarted = !!(await env.WARMAP.get(startKey));
-      console.log("UA still:", k.id, k.name, "startKey?", alreadyStarted);
-
-      if (!alreadyStarted) {
+      // Still flaming — send once if not throttled
+      console.log("UA still:", k.id, k.name);
+      if (!(await env.WARMAP.get(throttleKey))) {
         const ok = await notifyDiscord(env, {
           keepId: k.id,
           at: payload.updatedAt,
           keep: k,
         });
         if (ok) {
-          await safePutIfChanged(env, startKey, String(Date.now()), {
+          await env.WARMAP.put(throttleKey, "1", {
             expirationTtl: suppressTtl,
           });
           sentHeader++;
         }
       } else {
-        skippedHeader++; // no-op; don't spam KV by refreshing prevKey
+        skippedHeader++; // already sent recently
       }
     } else if (!curr && prev) {
       // Falling edge
       console.log("UA fall:", k.id, k.name);
       await safePutIfChanged(env, prevKey, "0");
+      // Optional: clear throttle immediately so a brand-new flame can alert right away
+      // await safeDelete(env, throttleKey);
       resetHeader++;
     }
   }
 
   console.log(
     `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
-  );
-
-  // Fallback: UA events with no visible banner
-  const byId = new Map(payload.keeps.map((k) => [k.id, k]));
-  let considered = 0,
-    deduped = 0,
-    sent = 0,
-    missing = 0;
-
-  for (const ev of payload.events) {
-    if (ev.kind !== "underAttack") continue;
-    const k = byId.get(ev.keepId);
-    if (!k) {
-      missing++;
-      continue;
-    }
-    if (k.headerUnderAttack) continue; // header path already handles
-
-    considered++;
-    const key = `alert:ua:nobanner:${ev.keepId}`;
-    if (await env.WARMAP.get(key)) {
-      deduped++;
-      continue;
-    }
-
-    const ok = await notifyDiscord(env, {
-      keepId: ev.keepId,
-      at: ev.at,
-      keep: k,
-    });
-    if (ok) {
-      await safePutIfChanged(env, key, "1", { expirationTtl: suppressTtl });
-      sent++;
-    }
-  }
-
-  console.log(
-    `fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`
   );
 }
 
