@@ -561,13 +561,13 @@ async function notifyDiscordPlayer(
   p: { name: string; realm: string },
   delta: number
 ) {
-  const url = env.DISCORD_WEBHOOK_URL_PLAYERS;
+  const url = env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL;
   if (!url) {
     console.log("no webhook configured for player alerts");
     return;
   }
-  const realm = normRealm(p.realm) ?? "Midgard";
 
+  const realm = normRealm(p.realm) ?? "Midgard";
   const color = REALM_COLOR[realm];
   const embed = {
     title: `🟢 ${p.name} is active`,
@@ -578,10 +578,9 @@ async function notifyDiscordPlayer(
     footer: { text: "Poofter Saz Watch" },
   };
 
-  await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username: "Uthgard Herald", embeds: [embed] }),
+  await postToDiscord(env, url, {
+    username: "Uthgard Herald",
+    embeds: [embed],
   });
 }
 
