@@ -467,19 +467,19 @@ async function alertOnUnderAttackTransitions(
     skippedHeader = 0,
     resetHeader = 0;
 
-  // Use a long TTL so a missed falling edge doesn't wedge state, and we don't need to refresh it every tick
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const ttlSec = windowMin * 240; // ~4× the attack window
-  const suppressTtl = windowMin * 60; // secondary dedupe for UA start
+  const ttlSec = windowMin * 240; // "state ON" TTL (~4× window)
+  const suppressTtl = windowMin * 60; // rising-edge dedupe TTL
 
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
+    const startKey = `alert:ua:start:${k.id}`;
+
     const prev = (await env.WARMAP.get(prevKey)) === "1";
     const curr = !!k.headerUnderAttack;
 
     if (curr && !prev) {
-      // Rising edge: send alert once per keep per flame start
-      const startKey = `alert:ua:start:${k.id}`;
+      // Rising edge: first time we see the banner "on"
       if (!(await env.WARMAP.get(startKey))) {
         const ok = await notifyDiscord(env, {
           keepId: k.id,
@@ -492,14 +492,28 @@ async function alertOnUnderAttackTransitions(
           });
         }
       }
-      // Mark UA state "on" with a long TTL (no per-tick refresh)
       await safePutIfChanged(env, prevKey, "1", { expirationTtl: ttlSec });
       sentHeader++;
     } else if (curr && prev) {
-      // Still flaming — no-op to avoid constant KV writes
-      skippedHeader++;
+      // Banner still on. If we somehow missed the rising-edge alert (no startKey), send it now.
+      if (!(await env.WARMAP.get(startKey))) {
+        const ok = await notifyDiscord(env, {
+          keepId: k.id,
+          at: payload.updatedAt,
+          keep: k,
+        });
+        if (ok) {
+          await safePutIfChanged(env, startKey, "1", {
+            expirationTtl: suppressTtl,
+          });
+          sentHeader++; // count as sent from header
+        }
+      } else {
+        // no-op: don't refresh prevKey TTL to reduce KV writes
+        skippedHeader++;
+      }
     } else if (!curr && prev) {
-      // Falling edge: clear immediately
+      // Falling edge: clear state immediately
       await safePutIfChanged(env, prevKey, "0");
       resetHeader++;
     }
@@ -509,7 +523,7 @@ async function alertOnUnderAttackTransitions(
     `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
   );
 
-  // Fallback path: UA events with no visible banner (rare but happens)
+  // Fallback: UA events with no visible banner
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
   let considered = 0,
     deduped = 0,
@@ -523,9 +537,11 @@ async function alertOnUnderAttackTransitions(
       missing++;
       continue;
     }
-    if (k.headerUnderAttack) continue; // banner already covered
-    considered++;
 
+    // If banner is visible, header path handles it (or the missed-edge fix above)
+    if (k.headerUnderAttack) continue;
+
+    considered++;
     const key = `alert:ua:nobanner:${ev.keepId}`;
     if (await env.WARMAP.get(key)) {
       deduped++;
