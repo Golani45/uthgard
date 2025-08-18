@@ -1019,6 +1019,16 @@ router.get("/admin/sim-ua", async (req, env: Environment) => {
   });
 });
 
+router.get("/admin/env-check", async (_req, env: Environment) => {
+  return createJsonResponse({
+    has: {
+      DISCORD_WEBHOOK_URL: !!env.DISCORD_WEBHOOK_URL,
+      DISCORD_WEBHOOK_CAPTURE: !!env.DISCORD_WEBHOOK_CAPTURE,
+      DISCORD_WEBHOOK_URL_PLAYERS: !!env.DISCORD_WEBHOOK_URL_PLAYERS,
+    },
+  });
+});
+
 // -------- Simulate a recent "captured" event path -------------
 router.get("/admin/sim-capture-event", async (req, env: Environment) => {
   const q = new URL(req.url).searchParams;
