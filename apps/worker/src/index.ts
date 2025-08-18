@@ -731,10 +731,6 @@ router.post("/admin/update", async (_req, env: Environment) => {
   }
 });
 
-router.get("/", () => new Response("OK"));
-router.get("/favicon.ico", () => new Response("", { status: 204 }));
-router.all("*", () => new Response("Not found", { status: 404 }));
-
 // === Add with the other routes ===
 router.get("/admin/peek", async (_req, env: Environment) => {
   const wm = await env.WARMAP.get<WarmapData>("warmap", "json");
@@ -804,6 +800,10 @@ router.post("/admin/reset-ua", async (req, env: Environment) => {
   await safeDelete(env, `alert:ua:nobanner:${keepId}`);
   return new Response(`reset ${keepId}`);
 });
+
+router.get("/", () => new Response("OK"));
+router.get("/favicon.ico", () => new Response("", { status: 204 }));
+router.all("*", () => new Response("Not found", { status: 404 }));
 
 async function safePutIfChanged(
   env: Environment,
