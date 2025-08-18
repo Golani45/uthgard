@@ -488,6 +488,20 @@ async function alertOnUnderAttackTransitions(
     const prevRaw = await env.WARMAP.get(prevKey);
     const prev = !!(prevRaw && prevRaw !== "0");
     const curr = !!k.headerUnderAttack;
+    const throttled = !!(await env.WARMAP.get(throttleKey));
+
+    console.log(
+      JSON.stringify({
+        tag: "UA_TRACE",
+        keep: k.id,
+        name: k.name,
+        curr,
+        prev,
+        throttled,
+        prevRaw,
+        throttleKey,
+      })
+    );
 
     if (curr && !prev) {
       // Rising edge — set state ON and try to send if not throttled
@@ -807,9 +821,37 @@ router.post("/admin/reset-ua", async (req, env: Environment) => {
   const url = new URL(req.url);
   const keepId = url.searchParams.get("keep");
   if (!keepId) return new Response("missing ?keep=<slug>", { status: 400 });
+
   await safePutIfChanged(env, `ua:state:${keepId}`, "0");
   await safeDelete(env, `alert:ua:nobanner:${keepId}`);
+  await safeDelete(env, `alert:ua:header:${keepId}`); // <-- add this
   return new Response(`reset ${keepId}`);
+});
+
+router.get("/admin/dump-keep-header", async (_req, env: Environment) => {
+  const html = await (
+    await fetch(env.HERALD_WARMAP_URL, {
+      cf: { cacheTtl: 0 },
+      headers: { "cache-control": "no-cache" },
+    })
+  ).text();
+  const doc = parse(html);
+  const keepDivs = doc.querySelectorAll("div.keepinfo");
+  const sample = keepDivs.slice(0, 5).map((div) => ({
+    id: (
+      div.querySelector("strong")?.text.trim() ||
+      div.getAttribute("id") ||
+      "Unknown"
+    )
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/(^-|-$)/g, ""),
+    headerText:
+      (div.querySelector('td[align="center"]') ?? div).innerText?.trim() ?? "",
+    headerHtml:
+      (div.querySelector('td[align="center"]') ?? div).innerHTML ?? "",
+  }));
+  return createJsonResponse({ sample });
 });
 
 router.get("/", () => new Response("OK"));
