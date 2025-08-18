@@ -248,6 +248,25 @@ async function postToDiscord(env: Environment, body: any): Promise<boolean> {
   return true;
 }
 
+// --- helpers for sims ---
+function mkKeepPartial(id: string, name: string, owner: Realm): Keep {
+  return {
+    id,
+    name,
+    type: "keep",
+    owner,
+    underAttack: false,
+    headerUnderAttack: false,
+    level: null,
+    claimedBy: null,
+    claimedAt: null,
+    emblem: null,
+  };
+}
+function nowIso() {
+  return new Date().toISOString();
+}
+
 function relToIsoBucketed(
   s: string,
   bucketCounts: Map<string, number>,
@@ -901,6 +920,120 @@ router.post("/admin/reset-ua", async (req, env: Environment) => {
   await safeDelete(env, `alert:ua:nobanner:${keepId}`);
   await safeDelete(env, `alert:ua:header:${keepId}`); // <-- add this
   return new Response(`reset ${keepId}`);
+});
+
+// -------- Simulate a header "flame" (UA) rising edge ----------
+router.get("/admin/sim-ua", async (req, env: Environment) => {
+  const q = new URL(req.url).searchParams;
+  const keepName = q.get("keep") ?? "Test Keep";
+  const owner = (q.get("realm") as Realm) ?? "Midgard";
+  const id = slug(keepName);
+
+  // Build a fake warmap snapshot with the keep flaming
+  const payload: WarmapData = {
+    updatedAt: nowIso(),
+    dfOwner: owner,
+    keeps: [
+      {
+        ...mkKeepPartial(id, keepName, owner),
+        headerUnderAttack: true,
+        underAttack: true,
+      },
+    ],
+    events: [],
+  };
+
+  console.log(JSON.stringify({ tag: "SIM_UA", id, keepName, owner }));
+  await alertOnUnderAttackTransitions(env, payload);
+  return createJsonResponse({
+    ok: true,
+    note: "UA simulation executed",
+    id,
+    keepName,
+    owner,
+  });
+});
+
+// -------- Simulate a recent "captured" event path -------------
+router.get("/admin/sim-capture-event", async (req, env: Environment) => {
+  const q = new URL(req.url).searchParams;
+  const keepName = q.get("keep") ?? "Test Keep";
+  const newOwner = (q.get("realm") as Realm) ?? "Midgard";
+  const minutesAgo = Number(q.get("ago") ?? "2");
+  const at = new Date(Date.now() - minutesAgo * 60_000).toISOString();
+  const id = slug(keepName);
+
+  const payload: WarmapData = {
+    updatedAt: nowIso(),
+    dfOwner: newOwner,
+    keeps: [mkKeepPartial(id, keepName, newOwner)],
+    events: [{ at, kind: "captured", keepId: id, keepName, newOwner }],
+  };
+
+  console.log(
+    JSON.stringify({ tag: "SIM_CAPTURE_EVENT", id, keepName, newOwner, at })
+  );
+  await alertOnRecentCapturesFromEvents(env, payload);
+  return createJsonResponse({ ok: true, id, keepName, newOwner, at });
+});
+
+// -------- Simulate ownership-change (rising-edge) path --------
+router.get("/admin/sim-ownership", async (req, env: Environment) => {
+  const q = new URL(req.url).searchParams;
+  const keepName = q.get("keep") ?? "Test Keep";
+  const prevOwner = (q.get("prev") as Realm) ?? "Albion";
+  const nowOwner = (q.get("now") as Realm) ?? "Midgard";
+  const id = slug(keepName);
+
+  // Prime baseline so the change is detected
+  await env.WARMAP.put(`own:${id}`, prevOwner);
+
+  const payload: WarmapData = {
+    updatedAt: nowIso(),
+    dfOwner: nowOwner,
+    keeps: [mkKeepPartial(id, keepName, nowOwner)],
+    events: [],
+  };
+
+  console.log(
+    JSON.stringify({ tag: "SIM_OWNERSHIP", id, keepName, prevOwner, nowOwner })
+  );
+  await alertOnOwnershipChanges(env, payload, null);
+  return createJsonResponse({ ok: true, id, keepName, prevOwner, nowOwner });
+});
+
+// -------- Simulate player activity alert ----------------------
+router.get("/admin/sim-player", async (req, env: Environment) => {
+  const q = new URL(req.url).searchParams;
+  const id = q.get("id") ?? "saz";
+  const name = q.get("name") ?? "Saz";
+  const realm = (q.get("realm") as Realm) ?? "Midgard";
+  const delta = Number(q.get("delta") ?? "500");
+
+  console.log(JSON.stringify({ tag: "SIM_PLAYER", id, name, realm, delta }));
+  await notifyDiscordPlayer(env, { name, realm }, delta);
+  return createJsonResponse({ ok: true, id, name, realm, delta });
+});
+
+// -------- KV dump helper (inspect state quickly) --------------
+router.get("/admin/kv-dump", async (req, env: Environment) => {
+  const p = new URL(req.url).searchParams.get("prefix") ?? "";
+  const keys = [
+    "ua:state:",
+    "alert:ua:header:",
+    "alert:under:",
+    "cap:event:",
+    "own:",
+    "rp:",
+    "rp:active:",
+  ].filter((k) => k.startsWith(p) || p === "");
+
+  const out: Record<string, string | null> = {};
+  for (const k of keys) {
+    // just sample a few known keys by combining prefix with common ids
+    out[k + "<example>"] = await env.WARMAP.get(k + "<example>");
+  }
+  return createJsonResponse({ prefix: p, sample: out });
 });
 
 router.get("/admin/dump-keep-header", async (_req, env: Environment) => {
