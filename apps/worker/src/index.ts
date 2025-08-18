@@ -237,7 +237,8 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const headerCell = div.querySelector('td[align="center"]') ?? div;
     const rawHeader = (headerCell?.innerText ?? "").trim();
 
-    const headerSaysUnderAttack = headerIsUnderAttack(headerCell);
+    const headerSaysUnderAttack =
+      headerIsUnderAttack(headerCell) || headerHasUAImage(headerCell);
 
     const lines = rawHeader
       .split("\n")
@@ -362,7 +363,7 @@ async function alertOnOwnershipChanges(
     const baseline = prevKV ?? prevOwnerById.get(k.id) ?? null;
 
     if (baseline == null) {
-      await safePut(env, ownKey, k.owner);
+      await safePutIfChanged(env, ownKey, k.owner);
       continue;
     }
     if (baseline !== k.owner) {
@@ -371,7 +372,7 @@ async function alertOnOwnershipChanges(
         newOwner: k.owner,
         at: payload.updatedAt,
       });
-      if (ok) await safePut(env, ownKey, k.owner);
+      if (ok) await safePutIfChanged(env, ownKey, k.owner);
     }
   }
 }
@@ -429,7 +430,7 @@ async function notifyDiscord(
     return false;
   }
 
-  await safePut(env, key, "1", { expirationTtl: 6 * 60 * 60 });
+  await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
   console.log("discord sent", e.keepId, e.keep.name, e.at);
   return true;
 }
@@ -466,8 +467,10 @@ async function alertOnUnderAttackTransitions(
     skippedHeader = 0,
     resetHeader = 0;
 
-  // expire "on" after ~2× your attack window
-  const ttlSec = Number(env.ATTACK_WINDOW_MIN ?? "7") * 120;
+  // Use a long TTL so a missed falling edge doesn't wedge state, and we don't need to refresh it every tick
+  const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
+  const ttlSec = windowMin * 240; // ~4× the attack window
+  const suppressTtl = windowMin * 60; // secondary dedupe for UA start
 
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
@@ -475,24 +478,29 @@ async function alertOnUnderAttackTransitions(
     const curr = !!k.headerUnderAttack;
 
     if (curr && !prev) {
-      console.log("UA rising:", k.id, k.name);
-      const ok = await notifyDiscord(env, {
-        keepId: k.id,
-        at: payload.updatedAt,
-        keep: k,
-      });
-      if (ok) {
-        // set with TTL so a missed falling edge doesn't wedge it forever
-        await safePut(env, prevKey, "1", { expirationTtl: ttlSec });
-        sentHeader++;
+      // Rising edge: send alert once per keep per flame start
+      const startKey = `alert:ua:start:${k.id}`;
+      if (!(await env.WARMAP.get(startKey))) {
+        const ok = await notifyDiscord(env, {
+          keepId: k.id,
+          at: payload.updatedAt,
+          keep: k,
+        });
+        if (ok) {
+          await safePutIfChanged(env, startKey, "1", {
+            expirationTtl: suppressTtl,
+          });
+        }
       }
+      // Mark UA state "on" with a long TTL (no per-tick refresh)
+      await safePutIfChanged(env, prevKey, "1", { expirationTtl: ttlSec });
+      sentHeader++;
     } else if (curr && prev) {
-      // refresh TTL while still flaming
-      await safePut(env, prevKey, "1", { expirationTtl: ttlSec });
+      // Still flaming — no-op to avoid constant KV writes
       skippedHeader++;
     } else if (!curr && prev) {
-      // banner went down → clear immediately
-      await safePut(env, prevKey, "0");
+      // Falling edge: clear immediately
+      await safePutIfChanged(env, prevKey, "0");
       resetHeader++;
     }
   }
@@ -501,8 +509,7 @@ async function alertOnUnderAttackTransitions(
     `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
   );
 
-  const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const suppressTtl = windowMin * 60;
+  // Fallback path: UA events with no visible banner (rare but happens)
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
   let considered = 0,
     deduped = 0,
@@ -516,23 +523,26 @@ async function alertOnUnderAttackTransitions(
       missing++;
       continue;
     }
-    if (k.headerUnderAttack) continue;
+    if (k.headerUnderAttack) continue; // banner already covered
     considered++;
+
     const key = `alert:ua:nobanner:${ev.keepId}`;
     if (await env.WARMAP.get(key)) {
       deduped++;
       continue;
     }
+
     const ok = await notifyDiscord(env, {
       keepId: ev.keepId,
       at: ev.at,
       keep: k,
     });
     if (ok) {
-      await safePut(env, key, "1", { expirationTtl: suppressTtl });
+      await safePutIfChanged(env, key, "1", { expirationTtl: suppressTtl });
       sent++;
     }
   }
+
   console.log(
     `fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`
   );
@@ -603,7 +613,7 @@ async function checkTrackedPlayers(env: Environment) {
       const increased = rp > prev;
 
       if (rp < prev) {
-        await safePut(env, rpKey, String(rp));
+        await safePutIfChanged(env, rpKey, String(rp));
         await safeDelete(env, activeKey);
         continue;
       }
@@ -625,7 +635,7 @@ async function checkTrackedPlayers(env: Environment) {
       }
 
       // Always update last seen RP
-      await safePut(env, rpKey, String(rp));
+      await safePutIfChanged(env, rpKey, String(rp));
     } catch (e: any) {
       console.log("error for", p.id, String(e?.message ?? e));
     }
@@ -730,20 +740,25 @@ router.post("/admin/reset-ua", async (req, env: Environment) => {
   const url = new URL(req.url);
   const keepId = url.searchParams.get("keep");
   if (!keepId) return new Response("missing ?keep=<slug>", { status: 400 });
-  await safePut(env, `ua:state:${keepId}`, "0");
+  await safePutIfChanged(env, `ua:state:${keepId}`, "0");
   await safeDelete(env, `alert:ua:nobanner:${keepId}`);
   return new Response(`reset ${keepId}`);
 });
 
-// Reset UA dedupe for a keep (if it got "stuck")
-router.post("/admin/reset-ua", async (req, env: Environment) => {
-  const url = new URL(req.url);
-  const keepId = url.searchParams.get("keep");
-  if (!keepId) return new Response("missing ?keep=<slug>", { status: 400 });
-  await env.WARMAP.put(`ua:state:${keepId}`, "0");
-  await env.WARMAP.delete(`alert:ua:nobanner:${keepId}`);
-  return new Response(`reset ${keepId}`);
-});
+async function safePutIfChanged(
+  env: Environment,
+  key: string,
+  value: string,
+  opts?: { expirationTtl?: number }
+) {
+  try {
+    const curr = await env.WARMAP.get(key);
+    if (curr === value && !opts?.expirationTtl) return; // nothing to do
+    await env.WARMAP.put(key, value, opts);
+  } catch (e: any) {
+    console.log("KV putIfChanged failed:", key, String(e?.message ?? e));
+  }
+}
 
 async function notifyDiscordPlayer(
   env: Environment,
@@ -825,7 +840,7 @@ async function updateWarmap(
     const prevHash = prev ? packForHash(prev) : null;
     const nextHash = packForHash(payload);
     if (prevHash !== nextHash) {
-      await safePut(env, "warmap", JSON.stringify(payload));
+      await safePutIfChanged(env, "warmap", JSON.stringify(payload));
     }
   }
 
