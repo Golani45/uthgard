@@ -109,8 +109,18 @@ function normText(s: string) {
     .trim();
 }
 
+function headerIsUnderAttack(node: any) {
+  const txt = normText(node.innerText ?? "");
+  if (/\bunder\s*attack\b/.test(txt)) return true;
+  // also accept image-based banners
+  const img = node.querySelector?.(
+    'img[src*="attack"], img[src*="flame"], img[alt*="attack" i]'
+  );
+  return !!img;
+}
+
 function hasUnderAttack(s: string) {
-  return /\bunder\s+attack\b/.test(normText(s));
+  return /\bunder\s*attack\b/.test(normText(s));
 }
 
 // ---- Tiny HTML RP extractor for Worker (no cheerio) ----
@@ -204,7 +214,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const rawHeader = (headerCell?.innerText ?? "").trim();
 
     // seed from header banner
-    const headerSaysUnderAttack = hasUnderAttack(rawHeader);
+    const headerSaysUnderAttack = headerIsUnderAttack(headerCell);
 
     // scan lines for a guild, skipping name/level/emblem/under attack
     const lines = rawHeader
@@ -252,7 +262,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 
   // --- events table (your existing code) ---
   const events: WarmapData["events"] = [];
-  const rows = doc.querySelectorAll("div.keepinfo table.TABLE tr");
+  const rows = doc.querySelectorAll("table.TABLE tr");
 
   const bucketCounts = new Map<string, number>();
   for (const tr of rows) {
@@ -316,6 +326,34 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   };
 }
 
+// NEW: alert once per ownership change (rising edge)
+async function alertOnOwnershipChanges(env: Environment, payload: WarmapData) {
+  for (const k of payload.keeps) {
+    const ownKey = `own:${k.id}`; // last owner we recorded
+    const prev = await env.WARMAP.get(ownKey);
+
+    if (!prev) {
+      // first time seeing this keep
+      await env.WARMAP.put(ownKey, k.owner);
+      continue;
+    }
+
+    if (prev !== k.owner) {
+      // owner actually changed
+      const ok = await notifyDiscordCapture(env, {
+        keepName: k.name,
+        newOwner: k.owner,
+        at: payload.updatedAt,
+      });
+      if (ok) {
+        await env.WARMAP.put(ownKey, k.owner);
+        // OPTIONAL tiny rate-limit if keeps flip-flop:
+        // await env.WARMAP.put(`own:rl:${k.id}`, "1", { expirationTtl: 120 });
+      }
+    }
+  }
+}
+
 const EMBED_FOOTER = { text: "Uthgard Herald watch" };
 // If you have a small square avatar to show on the webhook bot:
 const WEBHOOK_USERNAME = "Uthgard Herald";
@@ -372,56 +410,85 @@ async function notifyDiscord(
   return true;
 }
 
+async function notifyDiscordCapture(
+  env: Environment,
+  ev: { keepName: string; newOwner: Realm; at: string }
+) {
+  const url = env.DISCORD_WEBHOOK_URL;
+  if (!url) return false;
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      username: "Uthgard Herald",
+      embeds: [
+        {
+          title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}`,
+          color: REALM_COLOR[ev.newOwner],
+          timestamp: ev.at,
+          footer: { text: "Uthgard Herald watch" },
+        },
+      ],
+    }),
+  });
+  return resp.ok;
+}
+
 async function alertOnUnderAttackTransitions(
   env: Environment,
   payload: WarmapData
 ) {
-  // 3a) Header-based: one alert per true->false transition
+  // 1) Header-based rising edge
   for (const k of payload.keeps) {
-    const prevKey = `ua:state:${k.id}`; // '1' while banner up, '0' otherwise
+    const prevKey = `ua:state:${k.id}`;
     const prev = (await env.WARMAP.get(prevKey)) === "1";
-    const curr = !!k.headerUnderAttack; // <-- banner only
-
+    const curr = !!k.headerUnderAttack;
     if (curr && !prev) {
       const ok = await notifyDiscord(env, {
         keepId: k.id,
         at: payload.updatedAt,
         keep: k,
       });
-      if (ok) await env.WARMAP.put(prevKey, "1"); // sticky while banner is up
+      if (ok) await env.WARMAP.put(prevKey, "1");
     } else if (!curr && prev) {
-      await env.WARMAP.put(prevKey, "0"); // banner went down, arm future alerts
+      await env.WARMAP.put(prevKey, "0");
     }
   }
 
-  // 3b) Fallback: if a keep has NO banner but we do see a fresh “under attack” event,
-  // send exactly once per event timestamp.
+  // 2) Fallback: event rows when there is NO banner
+  const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
+  const suppressTtl = windowMin * 60; // seconds
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
+
   for (const ev of payload.events) {
     if (ev.kind !== "underAttack") continue;
     const k = byId.get(ev.keepId);
-    if (!k) continue;
-    if (k.headerUnderAttack) continue; // banner path already handled
-    const dedupeKey = `alert:evt:${ev.keepId}:${ev.at}`;
-    if (await env.WARMAP.get(dedupeKey)) continue;
+    if (!k || k.headerUnderAttack) continue; // banner path already handled
+
+    // single alert per keep while it's "under attack" without a banner
+    const key = `alert:ua:nobanner:${ev.keepId}`;
+    if (await env.WARMAP.get(key)) continue;
+
     const ok = await notifyDiscord(env, {
       keepId: ev.keepId,
       at: ev.at,
       keep: k,
     });
-    if (ok)
-      await env.WARMAP.put(dedupeKey, "1", { expirationTtl: 24 * 60 * 60 });
+    if (ok) await env.WARMAP.put(key, "1", { expirationTtl: suppressTtl });
   }
 }
 
-async function getOrUpdateWarmap(env: Environment, maxAgeMs = 30_000) {
+async function getOrUpdateWarmap(
+  env: Environment,
+  maxAgeMs = 30_000,
+  silent = false
+) {
   const existing = await env.WARMAP.get<WarmapData>("warmap", "json");
   if (existing) {
     const age = Date.now() - Date.parse(existing.updatedAt);
     if (!Number.isNaN(age) && age < maxAgeMs) return existing;
   }
-  // Stale or missing → refresh now
-  return await updateWarmap(env);
+  return await updateWarmap(env, { silent });
 }
 
 type Tracked = { id: string; name: string; realm: string; url: string };
@@ -512,7 +579,7 @@ const router = Router();
 
 router.get("/api/warmap.json", async (_req, env: Environment) => {
   try {
-    const data = await getOrUpdateWarmap(env, 30_000);
+    const data = await getOrUpdateWarmap(env, 30_000, /* silent */ true);
     return createJsonResponse(data);
   } catch (e: any) {
     return createJsonResponse(
@@ -557,7 +624,7 @@ router.post("/admin/kv-test", async (_request, environment: Environment) => {
 
 router.post("/admin/update", async (_req, env: Environment) => {
   try {
-    const payload = await updateWarmap(env);
+    const payload = await updateWarmap(env, { silent: false });
     return createJsonResponse({ ok: true, updatedAt: payload.updatedAt });
   } catch (e: any) {
     return createJsonResponse(
@@ -600,8 +667,11 @@ async function notifyDiscordPlayer(
   });
 }
 
-async function updateWarmap(env: Environment): Promise<WarmapData> {
-  const res = await fetch(env.HERALD_WARMAP_URL as string, {
+async function updateWarmap(
+  env: Environment,
+  opts?: { silent?: boolean }
+): Promise<WarmapData> {
+  const res = await fetch(env.HERALD_WARMAP_URL, {
     headers: {
       "user-agent": "UthgardHeraldBot/1.0 (+contact)",
       "cache-control": "no-cache",
@@ -612,12 +682,12 @@ async function updateWarmap(env: Environment): Promise<WarmapData> {
 
   const html = await res.text();
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-
-  // buildWarmapFromHtml already sets k.underAttack from header OR recent event window
   const payload = buildWarmapFromHtml(html, windowMin);
 
-  // 🔔 only on state transitions
-  await alertOnUnderAttackTransitions(env, payload);
+  if (!opts?.silent) {
+    await alertOnUnderAttackTransitions(env, payload); // your existing rising-edge logic
+    await alertOnOwnershipChanges(env, payload); // <-- new stable capture alerts
+  }
 
   await env.WARMAP.put("warmap", JSON.stringify(payload));
   return payload;
@@ -627,30 +697,16 @@ export default {
   fetch: (req: Request, env: Environment, ctx: ExecutionContext) =>
     router.handle(req, env, ctx),
 
-  scheduled: (
-    event: ScheduledEvent,
-    env: Environment,
-    ctx: ExecutionContext
-  ) => {
-    // run both tasks in parallel, safely
+  scheduled: (_event: any, env: Environment, ctx: ExecutionContext) => {
     ctx.waitUntil(
-      (async () => {
-        try {
-          await updateWarmap(env);
-        } catch (err) {
-          console.error("cron update failed:", err);
-        }
-      })()
+      updateWarmap(env, { silent: false }).catch((err) =>
+        console.error("cron update failed:", err)
+      )
     );
-
     ctx.waitUntil(
-      (async () => {
-        try {
-          await checkTrackedPlayers(env);
-        } catch (err) {
-          console.error("tracked players check failed:", err);
-        }
-      })()
+      checkTrackedPlayers(env).catch((err) =>
+        console.error("tracked players failed:", err)
+      )
     );
   },
 };
