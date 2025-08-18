@@ -111,10 +111,8 @@ function normText(s: string) {
 
 function headerIsUnderAttack(node: any): boolean {
   const text = normText(node?.textContent ?? "");
-  const textSaysUA = /\bunder\s*attack\b/.test(text);
-  return textSaysUA || headerHasUAImage(node);
+  return /\bunder\s*attack\b/.test(text);
 }
-
 function hasUnderAttack(s: string) {
   return /\bunder\s*attack\b/.test(normText(s));
 }
@@ -422,6 +420,7 @@ async function notifyDiscord(
     );
     return false;
   }
+
   await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 });
   console.log("discord sent", e.keepId, e.keep.name, e.at);
   return true;
