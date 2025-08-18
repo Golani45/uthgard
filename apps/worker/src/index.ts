@@ -157,6 +157,14 @@ function parseDfOwner(doc: ReturnType<typeof parse>): Realm {
   return "Midgard";
 }
 
+function packForHash(wm: WarmapData) {
+  return JSON.stringify({
+    keeps: wm.keeps,
+    events: wm.events,
+    dfOwner: wm.dfOwner,
+  });
+}
+
 function headerHasUAImage(node: any): boolean {
   if (!node?.querySelector) return false;
 
@@ -354,7 +362,7 @@ async function alertOnOwnershipChanges(
     const baseline = prevKV ?? prevOwnerById.get(k.id) ?? null;
 
     if (baseline == null) {
-      await env.WARMAP.put(ownKey, k.owner);
+      await safePut(env, ownKey, k.owner);
       continue;
     }
     if (baseline !== k.owner) {
@@ -363,7 +371,7 @@ async function alertOnOwnershipChanges(
         newOwner: k.owner,
         at: payload.updatedAt,
       });
-      if (ok) await env.WARMAP.put(ownKey, k.owner);
+      if (ok) await safePut(env, ownKey, k.owner);
     }
   }
 }
@@ -421,7 +429,7 @@ async function notifyDiscord(
     return false;
   }
 
-  await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 });
+  await safePut(env, key, "1", { expirationTtl: 6 * 60 * 60 });
   console.log("discord sent", e.keepId, e.keep.name, e.at);
   return true;
 }
@@ -475,16 +483,16 @@ async function alertOnUnderAttackTransitions(
       });
       if (ok) {
         // set with TTL so a missed falling edge doesn't wedge it forever
-        await env.WARMAP.put(prevKey, "1", { expirationTtl: ttlSec });
+        await safePut(env, prevKey, "1", { expirationTtl: ttlSec });
         sentHeader++;
       }
     } else if (curr && prev) {
       // refresh TTL while still flaming
-      await env.WARMAP.put(prevKey, "1", { expirationTtl: ttlSec });
+      await safePut(env, prevKey, "1", { expirationTtl: ttlSec });
       skippedHeader++;
     } else if (!curr && prev) {
       // banner went down → clear immediately
-      await env.WARMAP.put(prevKey, "0");
+      await safePut(env, prevKey, "0");
       resetHeader++;
     }
   }
@@ -521,7 +529,7 @@ async function alertOnUnderAttackTransitions(
       keep: k,
     });
     if (ok) {
-      await env.WARMAP.put(key, "1", { expirationTtl: suppressTtl });
+      await safePut(env, key, "1", { expirationTtl: suppressTtl });
       sent++;
     }
   }
@@ -540,7 +548,7 @@ async function getOrUpdateWarmap(
     const age = Date.now() - Date.parse(existing.updatedAt);
     if (!Number.isNaN(age) && age < maxAgeMs) return existing;
   }
-  return await updateWarmap(env, { silent });
+  return await updateWarmap(env, { silent: true, store: false });
 }
 
 type Tracked = { id: string; name: string; realm: string; url: string };
@@ -595,8 +603,8 @@ async function checkTrackedPlayers(env: Environment) {
       const increased = rp > prev;
 
       if (rp < prev) {
-        await env.WARMAP.put(rpKey, String(rp));
-        await env.WARMAP.delete(activeKey);
+        await safePut(env, rpKey, String(rp));
+        await safeDelete(env, activeKey);
         continue;
       }
 
@@ -617,7 +625,7 @@ async function checkTrackedPlayers(env: Environment) {
       }
 
       // Always update last seen RP
-      await env.WARMAP.put(rpKey, String(rp));
+      await safePut(env, rpKey, String(rp));
     } catch (e: any) {
       console.log("error for", p.id, String(e?.message ?? e));
     }
@@ -676,7 +684,7 @@ router.post("/admin/kv-test", async (_request, environment: Environment) => {
 
 router.post("/admin/update", async (_req, env: Environment) => {
   try {
-    const payload = await updateWarmap(env, { silent: false });
+    const payload = await updateWarmap(env, { silent: false, store: false });
     return createJsonResponse({ ok: true, updatedAt: payload.updatedAt });
   } catch (e: any) {
     return createJsonResponse(
@@ -722,8 +730,8 @@ router.post("/admin/reset-ua", async (req, env: Environment) => {
   const url = new URL(req.url);
   const keepId = url.searchParams.get("keep");
   if (!keepId) return new Response("missing ?keep=<slug>", { status: 400 });
-  await env.WARMAP.put(`ua:state:${keepId}`, "0");
-  await env.WARMAP.delete(`alert:ua:nobanner:${keepId}`);
+  await safePut(env, `ua:state:${keepId}`, "0");
+  await safeDelete(env, `alert:ua:nobanner:${keepId}`);
   return new Response(`reset ${keepId}`);
 });
 
@@ -766,20 +774,39 @@ async function notifyDiscordPlayer(
   });
 }
 
+async function safePut(
+  env: Environment,
+  key: string,
+  value: string,
+  opts?: { expirationTtl?: number }
+) {
+  try {
+    await env.WARMAP.put(key, value, opts);
+  } catch (e: any) {
+    console.log("KV put failed:", key, String(e?.message ?? e));
+  }
+}
+
+async function safeDelete(env: Environment, key: string) {
+  try {
+    await env.WARMAP.delete(key);
+  } catch (e: any) {
+    console.log("KV delete failed:", key, String(e?.message ?? e));
+  }
+}
+
 async function updateWarmap(
   env: Environment,
-  opts?: { silent?: boolean }
+  opts?: { silent?: boolean; store?: boolean }
 ): Promise<WarmapData> {
-  // Baseline captured once for non-silent comparisons
   const prev = await env.WARMAP.get<WarmapData>("warmap", "json");
 
-  // cache-bust fetch
   const u = new URL(env.HERALD_WARMAP_URL);
   u.searchParams.set("_", String(Math.floor(Date.now() / 30_000)));
 
   const res = await fetch(u.toString(), {
     headers: {
-      "user-agent": "UthgardHeraldBot/1.0 (+contact)",
+      "user-agent": "UthgardHeraldBot/1.0",
       "cache-control": "no-cache",
       pragma: "no-cache",
     },
@@ -793,16 +820,20 @@ async function updateWarmap(
     Number(env.ATTACK_WINDOW_MIN ?? "7")
   );
 
-  if (opts?.silent) {
-    // 👇 do NOT alert or write the baseline
-    return payload;
+  // Only write when changed (and only if store !== false)
+  if (opts?.store !== false) {
+    const prevHash = prev ? packForHash(prev) : null;
+    const nextHash = packForHash(payload);
+    if (prevHash !== nextHash) {
+      await safePut(env, "warmap", JSON.stringify(payload));
+    }
   }
 
-  // Only cron/admin runs alert logic + persists baseline
-  await alertOnUnderAttackTransitions(env, payload);
-  await alertOnOwnershipChanges(env, payload, prev ?? null);
+  if (!opts?.silent) {
+    await alertOnUnderAttackTransitions(env, payload);
+    await alertOnOwnershipChanges(env, payload, prev ?? null);
+  }
 
-  await env.WARMAP.put("warmap", JSON.stringify(payload));
   return payload;
 }
 
