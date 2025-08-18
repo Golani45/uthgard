@@ -298,7 +298,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const at = relToIsoBucketed(when, bucketCounts);
 
     let m = text.match(
-      /^(.+?) (?:has been|was)\s+captured by the forces of (Albion|Midgard|Hibernia)/i
+      /^(.+?) (?:has been|was)\s+captured by (?:the\s+forces\s+of\s+)?(Albion|Midgard|Hibernia)/i
     );
     if (m) {
       const keepName = m[1].trim();
@@ -886,7 +886,7 @@ async function alertOnRecentCapturesFromEvents(
   payload: WarmapData
 ) {
   const now = Date.now();
-  const WINDOW_MS = 10 * 60_000; // last 10 minutes
+  const WINDOW_MS = 30 * 60_000; // last 10 minutes
   for (const ev of payload.events) {
     if (ev.kind !== "captured") continue;
     const atMs = Date.parse(ev.at);
