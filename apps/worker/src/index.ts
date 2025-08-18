@@ -808,7 +808,7 @@ async function alertOnUnderAttackTransitions(
   );
 }
 
-const WEBHOOK_MIN_INTERVAL_MS = 1500; // ~40/min max, under Discord’s 30/min effective cap
+const WEBHOOK_MIN_INTERVAL_MS = 2200; // ~40/min max, under Discord’s 30/min effective cap
 
 function lastSendKeyFor(url: string) {
   return `discord:last:${cooldownKeyFor(url)}`;
