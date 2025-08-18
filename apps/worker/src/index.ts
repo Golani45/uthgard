@@ -481,6 +481,7 @@ async function alertOnUnderAttackTransitions(
   const ttlSec = windowMin * 240; // UA state "on" TTL
   const suppressTtl = windowMin * 60; // throttle TTL (send once per window)
 
+  // -------- Header-based UA detection (primary path)
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
     const throttleKey = `alert:ua:header:${k.id}`; // send-once-per-window throttle
@@ -506,7 +507,7 @@ async function alertOnUnderAttackTransitions(
     if (curr && !prev) {
       // Rising edge — set state ON and try to send if not throttled
       console.log("UA rise:", k.id, k.name);
-      if (!(await env.WARMAP.get(throttleKey))) {
+      if (!throttled) {
         const ok = await notifyDiscord(env, {
           keepId: k.id,
           at: payload.updatedAt,
@@ -529,7 +530,7 @@ async function alertOnUnderAttackTransitions(
     } else if (curr && prev) {
       // Still flaming — send once if not throttled
       console.log("UA still:", k.id, k.name);
-      if (!(await env.WARMAP.get(throttleKey))) {
+      if (!throttled) {
         const ok = await notifyDiscord(env, {
           keepId: k.id,
           at: payload.updatedAt,
@@ -556,6 +557,49 @@ async function alertOnUnderAttackTransitions(
 
   console.log(
     `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
+  );
+
+  // -------- Event-based fallback (when header banner isn't visible)
+  const byId = new Map(payload.keeps.map((k) => [k.id, k]));
+  let considered = 0,
+    deduped = 0,
+    sent = 0,
+    missing = 0;
+
+  for (const ev of payload.events) {
+    if (ev.kind !== "underAttack") continue;
+
+    const k = byId.get(ev.keepId);
+    if (!k) {
+      missing++;
+      continue;
+    }
+
+    // If header already shows a flame, the header path handled it.
+    if (k.headerUnderAttack) continue;
+
+    considered++;
+
+    // Dedupe: once per keep per window when there's no banner
+    const key = `alert:ua:nobanner:${ev.keepId}`;
+    if (await env.WARMAP.get(key)) {
+      deduped++;
+      continue;
+    }
+
+    const ok = await notifyDiscord(env, {
+      keepId: ev.keepId,
+      at: ev.at,
+      keep: k,
+    });
+    if (ok) {
+      await safePutIfChanged(env, key, "1", { expirationTtl: suppressTtl });
+      sent++;
+    }
+  }
+
+  console.log(
+    `fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`
   );
 }
 
