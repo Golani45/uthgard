@@ -118,16 +118,24 @@ function hasUnderAttack(s: string) {
   return /\bunder\s*attack\b/.test(normText(s));
 }
 
-// ---- Tiny HTML RP extractor for Worker (no cheerio) ----
 function parseRP(html: string): number | null {
-  const m = html.match(
-    /(Realmpoints|Realm\s*points)<\/t[dh]>\s*<t[dh][^>]*>\s*([\d.,\u00A0]+)/i
-  );
-  if (!m) return null;
-  const raw = m[2].replace(/[.,\u00A0]/g, "");
-  return Number(raw) || 0;
-}
+  const doc = parse(html);
+  // find a row whose first cell says Realmpoints (case/space tolerant)
+  for (const tr of doc.querySelectorAll("tr")) {
+    const cells = tr.querySelectorAll("td,th");
+    if (cells.length < 2) continue;
+    const left = (cells[0].textContent || "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .toLowerCase();
+    if (!/realm\s*points|realmpoints/.test(left)) continue;
 
+    const raw = (cells[1].textContent || "").replace(/[^\d]/g, "");
+    const n = Number(raw);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
 function parseRelative(s: string): { ms: number; bucket: string } {
   // normalize: strip () and "ago"
   const t = s
@@ -852,7 +860,7 @@ type Tracked = { id: string; name: string; realm: string; url: string };
 
 // ---- Check tracked players every cron tick ----
 // expects: notifyDiscordPlayer(...) -> Promise<boolean>
-async function checkTrackedPlayers(env: Environment) {
+async function checkTrackedPlayers(env: Environment, onlyId?: string) {
   if (!env.TRACKED_PLAYERS) return;
 
   let players: Tracked[];
@@ -866,6 +874,7 @@ async function checkTrackedPlayers(env: Environment) {
   const sessionMin = Number(env.ACTIVITY_SESSION_MIN ?? "30"); // minutes
 
   for (const p of players) {
+    if (onlyId && p.id !== onlyId) continue;
     try {
       const res = await fetch(p.url, {
         headers: {
@@ -1003,11 +1012,6 @@ router.get("/admin/debug-captures", async (_req, env: Environment) => {
     ownerBaselines: rows,
     note: "Ownership alert fires when owner != baseline; baseline is set on first sight.",
   });
-});
-
-router.post("/admin/scan-players", async (_req, env) => {
-  await checkTrackedPlayers(env);
-  return new Response("ok");
 });
 
 router.get("/admin/test-capture", async (req, env: Environment) => {
@@ -1161,11 +1165,15 @@ router.get("/admin/env-check", async (_req, env: Environment) => {
   });
 });
 
-router.post("/admin/scan-players", async (req, env) => {
-  const id = new URL(req.url).searchParams.get("id"); // optional
-  await checkTrackedPlayers(env); // runs full list
-  return new Response(id ? `scanned ${id}` : "scanned");
-});
+router.post(
+  "/admin/scan-players",
+  async (req, env: Environment, ctx: ExecutionContext) => {
+    const id = new URL(req.url).searchParams.get("id") ?? undefined;
+    // run in background so the request doesn’t time out when you have 15–20 players
+    ctx.waitUntil(checkTrackedPlayers(env, id));
+    return new Response(id ? `scanning ${id}` : "scanning all");
+  }
+);
 
 // -------- Simulate a recent "captured" event path -------------
 router.get("/admin/sim-capture-event", async (req, env: Environment) => {
