@@ -483,30 +483,30 @@ async function alertOnOwnershipChanges(
     const baseline = prevKV ?? prevOwnerById.get(k.id) ?? null;
 
     if (baseline == null) {
-      await safePutIfChanged(env, ownKey, k.owner);
+      await safePut(env, ownKey, k.owner); // first sighting of this keep
+      continue;
+    }
+    if (baseline === k.owner) continue; // no change
+
+    // --- NEW: event-level dedupe for this specific transition
+    const transition = `${baseline}->${k.owner}`;
+    const dedupeKey = `cap:${k.id}:${transition}`;
+    if (await env.WARMAP.get(dedupeKey)) {
+      // another invocation already sent this capture
       continue;
     }
 
-    if (baseline !== k.owner) {
-      // unified dedupe (shared with event-path)
-      const keepId = k.id; // already a slug in payload
-      const kAny = capDedupKey(keepId, k.owner, payload.updatedAt);
+    const ok = await notifyDiscordCapture(env, {
+      keepName: k.name,
+      newOwner: k.owner,
+      at: payload.updatedAt,
+    });
 
-      if (!(await env.WARMAP.get(kAny))) {
-        const ok = await notifyDiscordCapture(env, {
-          keepName: k.name,
-          newOwner: k.owner,
-          at: payload.updatedAt,
-        });
-        if (ok) {
-          await safePutIfChanged(env, kAny, "1", {
-            expirationTtl: 6 * 60 * 60,
-          });
-        }
-      }
-
-      // refresh ownership baseline after alert attempt
-      await safePutIfChanged(env, ownKey, k.owner);
+    if (ok) {
+      await Promise.all([
+        safePut(env, ownKey, k.owner), // persist new owner
+        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // 15-min dedupe
+      ]);
     }
   }
 }
