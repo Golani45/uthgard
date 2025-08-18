@@ -7,6 +7,9 @@ interface Environment {
   HERALD_WARMAP_URL: string;
   ATTACK_WINDOW_MIN?: string;
   DISCORD_WEBHOOK_URL?: string;
+  DISCORD_WEBHOOK_URL_PLAYERS?: string; // player activity
+  TRACKED_PLAYERS?: string; // ⬅️ stringified JSON
+  ACTIVITY_SESSION_MIN?: string; // ⬅️ minutes to treat as one "session" (default 30)
 }
 
 type Event = {
@@ -81,6 +84,14 @@ const ownerMap: Record<string, Realm> = {
   hibernia: "Hibernia",
 };
 
+function normRealm(r: string): Realm | null {
+  const t = r.toLowerCase();
+  if (t.startsWith("alb")) return "Albion";
+  if (t.startsWith("mid")) return "Midgard";
+  if (t.startsWith("hib")) return "Hibernia";
+  return null;
+}
+
 function slug(s: string) {
   return s
     .toLowerCase()
@@ -100,6 +111,16 @@ function normText(s: string) {
 
 function hasUnderAttack(s: string) {
   return /\bunder\s+attack\b/.test(normText(s));
+}
+
+// ---- Tiny HTML RP extractor for Worker (no cheerio) ----
+function parseRP(html: string): number | null {
+  const m = html.match(
+    /(Realmpoints|Realm\s*points)<\/t[dh]>\s*<t[dh][^>]*>\s*([\d.,\u00A0]+)/i
+  );
+  if (!m) return null;
+  const raw = m[2].replace(/[.,\u00A0]/g, "");
+  return Number(raw) || 0;
 }
 
 function parseRelative(s: string): { ms: number; bucket: string } {
@@ -375,7 +396,6 @@ async function alertOnUnderAttackTransitions(
 
   // 3b) Fallback: if a keep has NO banner but we do see a fresh “under attack” event,
   // send exactly once per event timestamp.
-  const minuteNow = Math.floor(Date.parse(payload.updatedAt) / 60000);
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
   for (const ev of payload.events) {
     if (ev.kind !== "underAttack") continue;
@@ -402,6 +422,90 @@ async function getOrUpdateWarmap(env: Environment, maxAgeMs = 30_000) {
   }
   // Stale or missing → refresh now
   return await updateWarmap(env);
+}
+
+type Tracked = { id: string; name: string; realm: string; url: string };
+
+// ---- Check tracked players every cron tick ----
+async function checkTrackedPlayers(env: Environment) {
+  if (!env.TRACKED_PLAYERS) return;
+
+  let players: Tracked[];
+  try {
+    players = JSON.parse(env.TRACKED_PLAYERS);
+  } catch {
+    console.log("TRACKED_PLAYERS is not valid JSON");
+    return;
+  }
+
+  const sessionMin = Number(env.ACTIVITY_SESSION_MIN ?? "30"); // default 30m
+
+  for (const p of players) {
+    try {
+      const res = await fetch(p.url, {
+        headers: {
+          "user-agent": "uthgard-tools (+your site)",
+          "cache-control": "no-cache",
+        },
+        cf: { cacheTtl: 0, cacheEverything: false },
+      });
+      if (!res.ok) {
+        console.log("fetch failed", p.id, res.status);
+        continue;
+      }
+
+      const html = await res.text();
+      const rp = parseRP(html);
+      if (rp == null) {
+        console.log("no RP found", p.id);
+        continue;
+      }
+
+      // KV keys
+      const rpKey = `rp:${p.id}`; // last seen RP total
+      const activeKey = `rp:active:${p.id}`; // set while in an "active session"
+
+      const prevRaw = await env.WARMAP.get(rpKey);
+      if (prevRaw == null) {
+        // First ever baseline — store and move on (no alert)
+        await env.WARMAP.put(rpKey, String(rp));
+        continue;
+      }
+
+      const prev = Number(prevRaw);
+      const increased = rp > prev;
+
+      if (rp < prev) {
+        await env.WARMAP.put(rpKey, String(rp));
+        await env.WARMAP.delete(activeKey);
+        continue;
+      }
+
+      if (increased) {
+        // Have we already alerted for the current session?
+        const isActive = await env.WARMAP.get(activeKey);
+
+        if (!isActive) {
+          const delta = rp - prev;
+          await notifyDiscordPlayer(env, p, delta);
+        }
+
+        // Refresh the session window: as long as we keep seeing increases
+        // within the TTL, no new "active" alert will fire.
+        await env.WARMAP.put(activeKey, "1", {
+          expirationTtl: sessionMin * 60, // seconds
+        });
+      }
+
+      // Always update last seen RP
+      await env.WARMAP.put(rpKey, String(rp));
+    } catch (e: any) {
+      console.log("error for", p.id, String(e?.message ?? e));
+    }
+
+    // Be gentle with the Herald
+    await new Promise((r) => setTimeout(r, 300));
+  }
 }
 
 const router = Router();
@@ -463,61 +567,37 @@ router.post("/admin/update", async (_req, env: Environment) => {
   }
 });
 
-router.all("*", () => new Response("Not found", { status: 404 }));
-
 router.get("/", () => new Response("OK"));
 router.get("/favicon.ico", () => new Response("", { status: 204 }));
+router.all("*", () => new Response("Not found", { status: 404 }));
 
-async function alertUnderAttacks(
+async function notifyDiscordPlayer(
   env: Environment,
-  payload: WarmapData,
-  windowMin: number
+  p: { name: string; realm: string },
+  delta: number
 ) {
-  const windowMs = windowMin * 60_000;
-  const now = Date.now();
-
-  // quick lookup
-  const byId = new Map(payload.keeps.map((k) => [k.id, k]));
-
-  // 1) Event-based alerts (what you already had)
-  const alertedFromEvent = new Set<string>();
-  for (const e of payload.events) {
-    if (e.kind !== "underAttack") continue;
-    if (now - Date.parse(e.at) > windowMs) continue;
-
-    const k = byId.get(e.keepId);
-    if (!k) continue;
-
-    await notifyDiscord(env, { keepId: e.keepId, at: e.at, keep: k });
-    alertedFromEvent.add(e.keepId);
+  const url = env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL;
+  if (!url) {
+    console.log("no webhook configured for player alerts");
+    return;
   }
+  const realm = normRealm(p.realm) ?? "Midgard";
 
-  // 2) Header-only alerts (no recent event row)
-  for (const k of payload.keeps) {
-    if (!k.underAttack) continue;
-    if (alertedFromEvent.has(k.id)) continue;
+  const color = REALM_COLOR[realm];
+  const embed = {
+    title: `🟢 ${p.name} is active`,
+    description: `+${delta.toLocaleString()} RPs gained`,
+    color,
+    fields: [{ name: "Realm", value: realm, inline: true }],
+    timestamp: new Date().toISOString(),
+    footer: { text: "Poofter Saz Watch" },
+  };
 
-    // (Optional) minute bucket so re-alerts can happen if it stays on fire a long time
-    const minuteBucket = Math.floor(Date.parse(payload.updatedAt) / 60000);
-    const headerKey = `alert:under:header:${k.id}:${minuteBucket}`;
-
-    if (await env.WARMAP.get(headerKey)) {
-      console.log("header dedupe", headerKey);
-      continue;
-    }
-
-    const sent = await notifyDiscord(env, {
-      keepId: k.id,
-      at: payload.updatedAt,
-      keep: k,
-    });
-
-    if (sent) {
-      await env.WARMAP.put(headerKey, "1", {
-        expirationTtl: Number(env.ATTACK_WINDOW_MIN ?? "7") * 60,
-      });
-    }
-  }
+  await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ username: "Uthgard Herald", embeds: [embed] }),
+  });
 }
 
 async function updateWarmap(env: Environment): Promise<WarmapData> {
@@ -547,24 +627,28 @@ export default {
   fetch: (req: Request, env: Environment, ctx: ExecutionContext) =>
     router.handle(req, env, ctx),
 
-  // BEFORE:
-  // scheduled: async (_evt: ScheduledEvent, env: Environment) => {
-  //   try { await updateWarmap(env); } catch (e) { ... }
-  // },
-
-  // AFTER:
   scheduled: (
     event: ScheduledEvent,
     env: Environment,
     ctx: ExecutionContext
   ) => {
+    // run both tasks in parallel, safely
     ctx.waitUntil(
       (async () => {
         try {
-          console.log("cron tick", new Date().toISOString());
           await updateWarmap(env);
         } catch (err) {
           console.error("cron update failed:", err);
+        }
+      })()
+    );
+
+    ctx.waitUntil(
+      (async () => {
+        try {
+          await checkTrackedPlayers(env);
+        } catch (err) {
+          console.error("tracked players check failed:", err);
         }
       })()
     );
