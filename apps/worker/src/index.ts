@@ -481,18 +481,28 @@ async function alertOnUnderAttackTransitions(
     if (curr && !prev) {
       // Rising edge: first time we see the banner "on"
       if (!(await env.WARMAP.get(startKey))) {
+        console.log(
+          "UA rise:",
+          k.id,
+          k.name,
+          "startKey exists?",
+          !!(await env.WARMAP.get(startKey))
+        );
+
         const ok = await notifyDiscord(env, {
           keepId: k.id,
           at: payload.updatedAt,
           keep: k,
         });
         if (ok) {
-          await safePutIfChanged(env, startKey, "1", {
+          await safePutIfChanged(env, startKey, String(Date.now()), {
             expirationTtl: suppressTtl,
           });
         }
       }
-      await safePutIfChanged(env, prevKey, "1", { expirationTtl: ttlSec });
+      await safePutIfChanged(env, prevKey, String(Date.now()), {
+        expirationTtl: ttlSec,
+      });
       sentHeader++;
     } else if (curr && prev) {
       // Banner still on. If we somehow missed the rising-edge alert (no startKey), send it now.
@@ -503,9 +513,10 @@ async function alertOnUnderAttackTransitions(
           keep: k,
         });
         if (ok) {
-          await safePutIfChanged(env, startKey, "1", {
+          await safePutIfChanged(env, startKey, String(Date.now()), {
             expirationTtl: suppressTtl,
           });
+
           sentHeader++; // count as sent from header
         }
       } else {
@@ -749,6 +760,39 @@ router.get("/admin/peek", async (_req, env: Environment) => {
       keepId: e.keepId,
       keep: e.keepName,
     })),
+  });
+});
+
+// === DEBUG: why a flaming keep didn't alert ===
+router.get("/admin/debug-ua", async (_req, env: Environment) => {
+  const wm = await env.WARMAP.get<WarmapData>("warmap", "json");
+  if (!wm) return new Response("no warmap", { status: 404 });
+
+  const flaming = wm.keeps.filter((k) => k.headerUnderAttack);
+  const rows = [];
+  for (const k of flaming) {
+    const prevKey = `ua:state:${k.id}`;
+    const startKey = `alert:ua:start:${k.id}`;
+    const prevVal = await env.WARMAP.get(prevKey);
+    const startVal = await env.WARMAP.get(startKey);
+    rows.push({
+      id: k.id,
+      name: k.name,
+      headerUA: true,
+      uaState_value: prevVal ?? null, // timestamp string or null
+      uaStart_value: startVal ?? null, // timestamp string or null
+    });
+  }
+
+  // also show a couple of last UA events we parsed
+  const uaEvents = wm.events
+    .filter((e) => e.kind === "underAttack")
+    .slice(0, 5);
+  return createJsonResponse({
+    updatedAt: wm.updatedAt,
+    flamingCount: flaming.length,
+    flaming: rows,
+    uaEvents_sample: uaEvents.map((e) => ({ keepId: e.keepId, at: e.at })),
   });
 });
 
