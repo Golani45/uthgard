@@ -52,6 +52,7 @@ interface Keep {
   type: KeepType;
   owner: Realm;
   underAttack: boolean;
+  headerUnderAttack?: boolean;
   lastEvent?: string;
   level?: number | null;
   claimedBy?: string | null;
@@ -216,7 +217,8 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
       name,
       type: "keep",
       owner,
-      underAttack: headerSaysUnderAttack, // seed from header
+      underAttack: headerSaysUnderAttack, // seed
+      headerUnderAttack: headerSaysUnderAttack, // NEW
       level,
       emblem,
       claimedBy,
@@ -274,14 +276,13 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   // apply under-attack window to set flames; OR with header flag
   const windowMs = attackWindowMin * 60_000;
   const now = Date.now();
-  for (const e of events) {
-    if (e.kind !== "underAttack") continue;
-    const k = byId.get(e.keepId);
-    if (!k) continue;
-    const t = Date.parse(e.at);
-    if (!Number.isNaN(t) && now - t <= windowMs) {
-      k.underAttack = true; // <-- keep flames even if header didn’t say it
-      k.lastEvent = e.at;
+  for (const event of events) {
+    if (event.kind === "underAttack") {
+      const keep: Keep | undefined = byId.get(event.keepId);
+      if (keep && now - Date.parse(event.at) <= windowMs) {
+        keep.underAttack = true; // ok to OR for the map
+        keep.lastEvent = event.at;
+      }
     }
   }
 
@@ -354,24 +355,42 @@ async function alertOnUnderAttackTransitions(
   env: Environment,
   payload: WarmapData
 ) {
+  // 3a) Header-based: one alert per true->false transition
   for (const k of payload.keeps) {
-    const stateKey = `ua:state:${k.id}`; // '1' = currently alerted (under attack), '0' = not
-    const prev = (await env.WARMAP.get(stateKey)) === "1";
-    const curr = !!k.underAttack;
+    const prevKey = `ua:state:${k.id}`; // '1' while banner up, '0' otherwise
+    const prev = (await env.WARMAP.get(prevKey)) === "1";
+    const curr = !!k.headerUnderAttack; // <-- banner only
 
     if (curr && !prev) {
-      // First time we notice this siege -> alert
       const ok = await notifyDiscord(env, {
         keepId: k.id,
         at: payload.updatedAt,
         keep: k,
       });
-      if (ok) await env.WARMAP.put(stateKey, "1"); // stick until siege ends
+      if (ok) await env.WARMAP.put(prevKey, "1"); // sticky while banner is up
     } else if (!curr && prev) {
-      // Siege ended -> allow future alerts
-      await env.WARMAP.put(stateKey, "0");
+      await env.WARMAP.put(prevKey, "0"); // banner went down, arm future alerts
     }
-    // else: no change -> no alert
+  }
+
+  // 3b) Fallback: if a keep has NO banner but we do see a fresh “under attack” event,
+  // send exactly once per event timestamp.
+  const minuteNow = Math.floor(Date.parse(payload.updatedAt) / 60000);
+  const byId = new Map(payload.keeps.map((k) => [k.id, k]));
+  for (const ev of payload.events) {
+    if (ev.kind !== "underAttack") continue;
+    const k = byId.get(ev.keepId);
+    if (!k) continue;
+    if (k.headerUnderAttack) continue; // banner path already handled
+    const dedupeKey = `alert:evt:${ev.keepId}:${ev.at}`;
+    if (await env.WARMAP.get(dedupeKey)) continue;
+    const ok = await notifyDiscord(env, {
+      keepId: ev.keepId,
+      at: ev.at,
+      keep: k,
+    });
+    if (ok)
+      await env.WARMAP.put(dedupeKey, "1", { expirationTtl: 24 * 60 * 60 });
   }
 }
 
@@ -526,16 +545,28 @@ async function updateWarmap(env: Environment): Promise<WarmapData> {
 
 export default {
   fetch: (req: Request, env: Environment, ctx: ExecutionContext) =>
-    router.handle(req, env, ctx).catch((err) => {
-      console.error("Unhandled error:", err);
-      return new Response("Internal Server Error", { status: 500 });
-    }),
+    router.handle(req, env, ctx),
 
-  scheduled: async (_evt: ScheduledEvent, env: Environment) => {
-    try {
-      await updateWarmap(env); // <— no more “empty KV” writes
-    } catch (err) {
-      console.error("cron update failed:", err);
-    }
+  // BEFORE:
+  // scheduled: async (_evt: ScheduledEvent, env: Environment) => {
+  //   try { await updateWarmap(env); } catch (e) { ... }
+  // },
+
+  // AFTER:
+  scheduled: (
+    event: ScheduledEvent,
+    env: Environment,
+    ctx: ExecutionContext
+  ) => {
+    ctx.waitUntil(
+      (async () => {
+        try {
+          console.log("cron tick", new Date().toISOString());
+          await updateWarmap(env);
+        } catch (err) {
+          console.error("cron update failed:", err);
+        }
+      })()
+    );
   },
 };
