@@ -163,6 +163,21 @@ function parseDfOwner(doc: ReturnType<typeof parse>): Realm {
   return "Midgard";
 }
 
+function headerHasUAImage(node: any) {
+  const imgs = node.querySelectorAll?.("img") ?? [];
+  for (const im of imgs) {
+    const src = (im.getAttribute("src") || "").toLowerCase();
+    const alt = (im.getAttribute("alt") || "").toLowerCase();
+    if (
+      /attack|under|flame|alarm|warn|alert|ua/.test(src) ||
+      /attack|under/.test(alt)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function relToIsoBucketed(
   s: string,
   bucketCounts: Map<string, number>,
@@ -214,8 +229,13 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const rawHeader = (headerCell?.innerText ?? "").trim();
 
     // seed from header banner
-    const headerSaysUnderAttack = headerIsUnderAttack(headerCell);
-
+    const headerText = (
+      headerCell?.innerText ||
+      headerCell?.textContent ||
+      ""
+    ).trim();
+    const headerSaysUnderAttack =
+      hasUnderAttack(headerText) || headerHasUAImage(headerCell);
     // scan lines for a guild, skipping name/level/emblem/under attack
     const lines = rawHeader
       .split("\n")
@@ -327,29 +347,28 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 }
 
 // NEW: alert once per ownership change (rising edge)
-async function alertOnOwnershipChanges(env: Environment, payload: WarmapData) {
+async function alertOnOwnershipChanges(
+  env: Environment,
+  payload: WarmapData,
+  prev: WarmapData | null
+) {
+  const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
   for (const k of payload.keeps) {
-    const ownKey = `own:${k.id}`; // last owner we recorded
-    const prev = await env.WARMAP.get(ownKey);
+    const ownKey = `own:${k.id}`;
+    const prevKV = await env.WARMAP.get(ownKey);
+    const baseline = prevKV ?? prevOwnerById.get(k.id) ?? null;
 
-    if (!prev) {
-      // first time seeing this keep
+    if (baseline == null) {
       await env.WARMAP.put(ownKey, k.owner);
       continue;
     }
-
-    if (prev !== k.owner) {
-      // owner actually changed
+    if (baseline !== k.owner) {
       const ok = await notifyDiscordCapture(env, {
         keepName: k.name,
         newOwner: k.owner,
         at: payload.updatedAt,
       });
-      if (ok) {
-        await env.WARMAP.put(ownKey, k.owner);
-        // OPTIONAL tiny rate-limit if keeps flip-flop:
-        // await env.WARMAP.put(`own:rl:${k.id}`, "1", { expirationTtl: 120 });
-      }
+      if (ok) await env.WARMAP.put(ownKey, k.owner);
     }
   }
 }
@@ -671,22 +690,32 @@ async function updateWarmap(
   env: Environment,
   opts?: { silent?: boolean }
 ): Promise<WarmapData> {
-  const res = await fetch(env.HERALD_WARMAP_URL, {
+  // read previous before fetching the new page (for capture baseline)
+  const prev = await env.WARMAP.get<WarmapData>("warmap", "json");
+
+  // cache-bust query (changes every 30s)
+  const u = new URL(env.HERALD_WARMAP_URL);
+  u.searchParams.set("_", String(Math.floor(Date.now() / 30_000)));
+
+  const res = await fetch(u.toString(), {
     headers: {
       "user-agent": "UthgardHeraldBot/1.0 (+contact)",
       "cache-control": "no-cache",
+      pragma: "no-cache", // some caches honor this
     },
-    cf: { cacheTtl: 0, cacheEverything: false },
+    cf: { cacheTtl: 0, cacheEverything: false }, // Cloudflare hint
   });
   if (!res.ok) throw new Error(`Herald ${res.status}`);
 
   const html = await res.text();
-  const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const payload = buildWarmapFromHtml(html, windowMin);
+  const payload = buildWarmapFromHtml(
+    html,
+    Number(env.ATTACK_WINDOW_MIN ?? "7")
+  );
 
   if (!opts?.silent) {
-    await alertOnUnderAttackTransitions(env, payload); // your existing rising-edge logic
-    await alertOnOwnershipChanges(env, payload); // <-- new stable capture alerts
+    await alertOnUnderAttackTransitions(env, payload); // rising-edge from banner+fallback
+    await alertOnOwnershipChanges(env, payload, prev ?? null); // once per real owner change
   }
 
   await env.WARMAP.put("warmap", JSON.stringify(payload));
