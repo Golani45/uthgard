@@ -476,7 +476,7 @@ async function alertOnUnderAttackTransitions(
     const startKey = `alert:ua:start:${k.id}`;
 
     const prevRaw = await env.WARMAP.get(prevKey);
-    const prev = !!prevRaw; // <-- accept "1" or timestamp
+    const prev = !!(prevRaw && prevRaw !== "0");
     const curr = !!k.headerUnderAttack;
 
     if (curr && !prev) {
@@ -868,6 +868,31 @@ async function safeDelete(env: Environment, key: string) {
   }
 }
 
+async function alertOnRecentCapturesFromEvents(
+  env: Environment,
+  payload: WarmapData
+) {
+  const now = Date.now();
+  const WINDOW_MS = 10 * 60_000; // last 10 minutes
+  for (const ev of payload.events) {
+    if (ev.kind !== "captured") continue;
+    const atMs = Date.parse(ev.at);
+    if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
+
+    const key = `cap:event:${ev.keepId}:${ev.at}`;
+    if (await env.WARMAP.get(key)) continue;
+
+    const ok = await notifyDiscordCapture(env, {
+      keepName: ev.keepName,
+      newOwner: ev.newOwner!, // present for captured
+      at: ev.at,
+    });
+    if (ok) {
+      await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
+    }
+  }
+}
+
 async function updateWarmap(
   env: Environment,
   opts?: { silent?: boolean; store?: boolean }
@@ -905,8 +930,8 @@ async function updateWarmap(
   if (!opts?.silent) {
     await alertOnUnderAttackTransitions(env, payload);
     await alertOnOwnershipChanges(env, payload, prev ?? null);
+    await alertOnRecentCapturesFromEvents(env, payload);
   }
-
   return payload;
 }
 
@@ -914,16 +939,20 @@ export default {
   fetch: (req: Request, env: Environment, ctx: ExecutionContext) =>
     router.handle(req, env, ctx),
 
-  scheduled: (_event: any, env: Environment, ctx: ExecutionContext) => {
-    ctx.waitUntil(
-      updateWarmap(env, { silent: false }).catch((err) =>
-        console.error("cron update failed:", err)
-      )
-    );
-    ctx.waitUntil(
-      checkTrackedPlayers(env).catch((err) =>
-        console.error("tracked players failed:", err)
-      )
-    );
+  // IMPORTANT: run warmap update first, and keep player checks from starving the tick
+  scheduled: async (_event: any, env: Environment, ctx: ExecutionContext) => {
+    try {
+      // Run alerts first and await them so the cron definitely pushes Discord messages
+      await updateWarmap(env, { silent: false });
+
+      // Kick player checks into the background, but keep them lightweight per tick
+      ctx.waitUntil(
+        checkTrackedPlayers(env).catch((err) =>
+          console.error("tracked players failed:", err)
+        )
+      );
+    } catch (err) {
+      console.error("cron update failed:", err);
+    }
   },
 };
