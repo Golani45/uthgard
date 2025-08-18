@@ -570,11 +570,11 @@ async function notifyDiscordPlayer(
   env: Environment,
   p: { name: string; realm: string },
   delta: number
-) {
+): Promise<boolean> {
   const url = env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL;
   if (!url) {
     console.log("no webhook configured for player alerts");
-    return;
+    return false;
   }
 
   const realm = normRealm(p.realm) ?? "Midgard";
@@ -588,7 +588,7 @@ async function notifyDiscordPlayer(
     footer: { text: "Poofter Saz Watch" },
   };
 
-  await postToDiscord(env, url, {
+  return await postToDiscord(env, url, {
     username: "Uthgard Herald",
     embeds: [embed],
   });
@@ -851,6 +851,7 @@ async function getOrUpdateWarmap(
 type Tracked = { id: string; name: string; realm: string; url: string };
 
 // ---- Check tracked players every cron tick ----
+// expects: notifyDiscordPlayer(...) -> Promise<boolean>
 async function checkTrackedPlayers(env: Environment) {
   if (!env.TRACKED_PLAYERS) return;
 
@@ -862,7 +863,7 @@ async function checkTrackedPlayers(env: Environment) {
     return;
   }
 
-  const sessionMin = Number(env.ACTIVITY_SESSION_MIN ?? "30"); // default 30m
+  const sessionMin = Number(env.ACTIVITY_SESSION_MIN ?? "30"); // minutes
 
   for (const p of players) {
     try {
@@ -879,55 +880,64 @@ async function checkTrackedPlayers(env: Environment) {
       }
 
       const html = await res.text();
-      const rp = parseRP(html);
+      const rp = parseRP(html); // LIFETIME RP (keep this)
       if (rp == null) {
         console.log("no RP found", p.id);
         continue;
       }
 
-      // KV keys
-      const rpKey = `rp:${p.id}`; // last seen RP total
-      const activeKey = `rp:active:${p.id}`; // set while in an "active session"
+      const rpKey = `rp:${p.id}`; // baseline total RP
+      const activeKey = `rp:active:${p.id}`; // "in session" flag
 
       const prevRaw = await env.WARMAP.get(rpKey);
+
       if (prevRaw == null) {
-        // First ever baseline — store and move on (no alert)
-        await env.WARMAP.put(rpKey, String(rp));
-        continue;
-      }
-
-      const prev = Number(prevRaw);
-      const increased = rp > prev;
-
-      if (rp < prev) {
+        // first sighting — store baseline, no alert
         await safePutIfChanged(env, rpKey, String(rp));
-        await safeDelete(env, activeKey);
-        continue;
-      }
+      } else {
+        const prev = Number(prevRaw);
 
-      if (increased) {
-        // Have we already alerted for the current session?
-        const isActive = await env.WARMAP.get(activeKey);
-
-        if (!isActive) {
-          const delta = rp - prev;
-          await notifyDiscordPlayer(env, p, delta);
+        if (!Number.isFinite(prev)) {
+          // corrupted baseline, reset it
+          await safePutIfChanged(env, rpKey, String(rp));
+        } else if (rp < prev) {
+          // rollover / reset: drop session and reset baseline
+          await safePutIfChanged(env, rpKey, String(rp));
+          await safeDelete(env, activeKey);
+        } else if (rp > prev) {
+          // gained RPs since last tick
+          const isActive = !!(await env.WARMAP.get(activeKey));
+          if (!isActive) {
+            const ok = await notifyDiscordPlayer(env, p, rp - prev);
+            if (ok) {
+              // only start a session if we actually notified
+              await safePutIfChanged(env, activeKey, "1", {
+                expirationTtl: sessionMin * 60,
+              });
+            }
+          } else {
+            // still active — refresh the session window
+            await safePutIfChanged(env, activeKey, "1", {
+              expirationTtl: sessionMin * 60,
+            });
+          }
+          // update baseline to the new total
+          await safePutIfChanged(env, rpKey, String(rp));
+        } else {
+          // equal RPs; if already in a session, refresh the TTL
+          const isActive = !!(await env.WARMAP.get(activeKey));
+          if (isActive) {
+            await safePutIfChanged(env, activeKey, "1", {
+              expirationTtl: sessionMin * 60,
+            });
+          }
         }
-
-        // Refresh the session window: as long as we keep seeing increases
-        // within the TTL, no new "active" alert will fire.
-        await env.WARMAP.put(activeKey, "1", {
-          expirationTtl: sessionMin * 60, // seconds
-        });
       }
-
-      // Always update last seen RP
-      await safePutIfChanged(env, rpKey, String(rp));
     } catch (e: any) {
       console.log("error for", p.id, String(e?.message ?? e));
     }
 
-    // Be gentle with the Herald
+    // be gentle with the Herald
     await new Promise((r) => setTimeout(r, 300));
   }
 }
@@ -1252,6 +1262,21 @@ router.get("/admin/dump-keep-header", async (_req, env: Environment) => {
       (div.querySelector('td[align="center"]') ?? div).innerHTML ?? "",
   }));
   return createJsonResponse({ sample });
+});
+
+router.get("/admin/debug-player", async (req, env: Environment) => {
+  const id = new URL(req.url).searchParams.get("id")!;
+  const rpKey = `rp:${id}`;
+  const activeKey = `rp:active:${id}`;
+  const [rp, active] = await Promise.all([
+    env.WARMAP.get(rpKey),
+    env.WARMAP.get(activeKey),
+  ]);
+  return createJsonResponse({
+    id,
+    rpBaseline: rp ?? null,
+    activeSession: !!active,
+  });
 });
 
 router.get("/", () => new Response("OK"));
