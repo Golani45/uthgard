@@ -187,6 +187,67 @@ function headerHasUAImage(node: any): boolean {
   return !!node.querySelector(selector);
 }
 
+// --- Discord rate-limit gate ---
+const RL_KEY = "discord:cooldown_until"; // ISO timestamp
+
+async function discordCooldownActive(env: Environment): Promise<boolean> {
+  const until = await env.WARMAP.get(RL_KEY);
+  return until ? Date.now() < Date.parse(until) : false;
+}
+
+async function setDiscordCooldown(env: Environment, secs: number) {
+  const until = new Date(Date.now() + secs * 1000).toISOString();
+  await env.WARMAP.put(RL_KEY, until, { expirationTtl: Math.ceil(secs) + 1 });
+}
+
+function parseRetryAfter(resp: Response): number {
+  // Discord sends either Retry-After (seconds) or X-RateLimit-Reset-After (seconds)
+  const ra = resp.headers.get("Retry-After");
+  const xra = resp.headers.get("X-RateLimit-Reset-After");
+  const n = Number(ra ?? xra);
+  return Number.isFinite(n) && n > 0 ? n : 2; // default 2s if missing
+}
+
+async function postToDiscord(env: Environment, body: any): Promise<boolean> {
+  const url = env.DISCORD_WEBHOOK_URL;
+  if (!url) {
+    console.log("discord: missing DISCORD_WEBHOOK_URL");
+    return false;
+  }
+
+  // global gate
+  if (await discordCooldownActive(env)) {
+    console.log("discord: global cooldown active — skipping this send");
+    return false;
+  }
+
+  const resp = await fetch(url, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (resp.status === 429) {
+    const secs = parseRetryAfter(resp);
+    await setDiscordCooldown(env, secs);
+    console.log(
+      "discord 429, backing off secs:",
+      secs,
+      "code:",
+      await resp.text().catch(() => "")
+    );
+    return false;
+  }
+
+  if (!resp.ok) {
+    const txt = await resp.text().catch(() => "...");
+    console.log("discord error", resp.status, txt);
+    return false;
+  }
+
+  return true;
+}
+
 function relToIsoBucketed(
   s: string,
   bucketCounts: Map<string, number>,
@@ -388,12 +449,6 @@ async function notifyDiscord(
   env: Environment,
   e: { keepId: string; at: string; keep: Keep }
 ): Promise<boolean> {
-  const url = env.DISCORD_WEBHOOK_URL;
-  if (!url) {
-    console.log("discord: missing DISCORD_WEBHOOK_URL");
-    return false;
-  }
-
   const key = `alert:under:${e.keepId}:${e.at}`;
   if (await env.WARMAP.get(key)) {
     console.log("discord: event dedupe", key);
@@ -414,61 +469,37 @@ async function notifyDiscord(
     ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
   };
 
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ username: "Uthgard Herald", embeds: [embed] }),
+  const ok = await postToDiscord(env, {
+    username: "Uthgard Herald",
+    embeds: [embed],
   });
 
-  if (!resp.ok) {
-    console.log(
-      "discord error",
-      resp.status,
-      await resp.text().catch(() => "...")
-    );
-    return false;
+  if (ok) {
+    await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
+    console.log("discord sent", e.keepId, e.keep.name, e.at);
   }
-
-  await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
-  console.log("discord sent", e.keepId, e.keep.name, e.at);
-  return true;
+  return ok;
 }
 
 async function notifyDiscordCapture(
   env: Environment,
   ev: { keepName: string; newOwner: Realm; at: string }
 ) {
-  const url = env.DISCORD_WEBHOOK_URL;
-  if (!url) {
-    console.log("discord: missing DISCORD_WEBHOOK_URL (capture)");
-    return false;
-  }
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      username: "Uthgard Herald",
-      embeds: [
-        {
-          title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}`,
-          color: REALM_COLOR[ev.newOwner],
-          timestamp: ev.at,
-          footer: { text: "Uthgard Herald watch" },
-        },
-      ],
-    }),
+  const embed = {
+    title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}`,
+    color: REALM_COLOR[ev.newOwner],
+    timestamp: ev.at,
+    footer: { text: "Uthgard Herald watch" },
+  };
+
+  const ok = await postToDiscord(env, {
+    username: "Uthgard Herald",
+    embeds: [embed],
   });
 
-  if (!resp.ok) {
-    console.log(
-      "discord capture error",
-      resp.status,
-      await resp.text().catch(() => "...")
-    );
-  }
-  return resp.ok;
+  if (!ok) console.log("discord capture send failed");
+  return ok;
 }
-
 async function alertOnUnderAttackTransitions(
   env: Environment,
   payload: WarmapData
