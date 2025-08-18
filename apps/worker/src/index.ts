@@ -279,6 +279,8 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   // --- events table (your existing code) ---
   const events: WarmapData["events"] = [];
   const rows = doc.querySelectorAll("div.keepinfo table.TABLE tr");
+  console.log("event rows found:", rows.length);
+
   const bucketCounts = new Map<string, number>();
   for (const tr of rows) {
     const tds = tr.querySelectorAll("td");
