@@ -1005,6 +1005,11 @@ router.get("/admin/debug-captures", async (_req, env: Environment) => {
   });
 });
 
+router.post("/admin/scan-players", async (_req, env) => {
+  await checkTrackedPlayers(env);
+  return new Response("ok");
+});
+
 router.get("/admin/test-capture", async (req, env: Environment) => {
   const q = new URL(req.url).searchParams;
   const keep = q.get("keep") ?? "Test Keep";
@@ -1154,6 +1159,12 @@ router.get("/admin/env-check", async (_req, env: Environment) => {
       DISCORD_WEBHOOK_URL_PLAYERS: !!env.DISCORD_WEBHOOK_URL_PLAYERS,
     },
   });
+});
+
+router.post("/admin/scan-players", async (req, env) => {
+  const id = new URL(req.url).searchParams.get("id"); // optional
+  await checkTrackedPlayers(env); // runs full list
+  return new Response(id ? `scanned ${id}` : "scanned");
 });
 
 // -------- Simulate a recent "captured" event path -------------
