@@ -298,7 +298,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const at = relToIsoBucketed(when, bucketCounts);
 
     let m = text.match(
-      /^(.+?) has been captured by the forces of (Albion|Midgard|Hibernia)/i
+      /^(.+?) (?:has been|was)\s+captured by the forces of (Albion|Midgard|Hibernia)/i
     );
     if (m) {
       const keepName = m[1].trim();
@@ -313,7 +313,6 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
       });
       continue;
     }
-
     m = text.match(/^(.+?) (?:is|was) under attack/i);
     if (m) {
       const keepName = m[1].trim();
@@ -440,7 +439,10 @@ async function notifyDiscordCapture(
   ev: { keepName: string; newOwner: Realm; at: string }
 ) {
   const url = env.DISCORD_WEBHOOK_URL;
-  if (!url) return false;
+  if (!url) {
+    console.log("discord: missing DISCORD_WEBHOOK_URL (capture)");
+    return false;
+  }
   const resp = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -456,6 +458,14 @@ async function notifyDiscordCapture(
       ],
     }),
   });
+
+  if (!resp.ok) {
+    console.log(
+      "discord capture error",
+      resp.status,
+      await resp.text().catch(() => "...")
+    );
+  }
   return resp.ok;
 }
 
@@ -664,6 +674,47 @@ router.get("/admin/test-hook", async (_req, env: Environment) => {
     },
   });
   return new Response("sent");
+});
+
+router.get("/admin/debug-captures", async (_req, env: Environment) => {
+  const wm = await env.WARMAP.get<WarmapData>("warmap", "json");
+  if (!wm) return createJsonResponse({ error: "no warmap" }, 404);
+
+  const recentEvents = wm.events
+    .filter((e) => e.kind === "captured")
+    .slice(0, 10);
+
+  // Compare current owner with baseline to see if rising-edge would trigger
+  const rows = [];
+  for (const k of wm.keeps) {
+    const ownKey = `own:${k.id}`;
+    const baseline = await env.WARMAP.get(ownKey);
+    rows.push({
+      id: k.id,
+      name: k.name,
+      owner: k.owner,
+      baseline: baseline ?? null,
+    });
+  }
+
+  return createJsonResponse({
+    updatedAt: wm.updatedAt,
+    recentCaptureEvents: recentEvents,
+    ownerBaselines: rows,
+    note: "Ownership alert fires when owner != baseline; baseline is set on first sight.",
+  });
+});
+
+router.get("/admin/test-capture", async (req, env: Environment) => {
+  const q = new URL(req.url).searchParams;
+  const keep = q.get("keep") ?? "Test Keep";
+  const realm = (q.get("realm") as Realm) ?? "Midgard";
+  const ok = await notifyDiscordCapture(env, {
+    keepName: keep,
+    newOwner: realm,
+    at: new Date().toISOString(),
+  });
+  return createJsonResponse({ ok, keep, realm });
 });
 
 router.post("/admin/kv-test", async (_request, environment: Environment) => {
