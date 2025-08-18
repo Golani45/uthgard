@@ -468,27 +468,23 @@ async function alertOnUnderAttackTransitions(
     resetHeader = 0;
 
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const ttlSec = windowMin * 240; // "state ON" TTL (~4× window)
+  const ttlSec = windowMin * 240; // UA state "on" TTL
   const suppressTtl = windowMin * 60; // rising-edge dedupe TTL
 
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
     const startKey = `alert:ua:start:${k.id}`;
 
-    const prev = (await env.WARMAP.get(prevKey)) === "1";
+    const prevRaw = await env.WARMAP.get(prevKey);
+    const prev = !!prevRaw; // <-- accept "1" or timestamp
     const curr = !!k.headerUnderAttack;
 
     if (curr && !prev) {
-      // Rising edge: first time we see the banner "on"
-      if (!(await env.WARMAP.get(startKey))) {
-        console.log(
-          "UA rise:",
-          k.id,
-          k.name,
-          "startKey exists?",
-          !!(await env.WARMAP.get(startKey))
-        );
+      // Rising edge
+      const alreadyStarted = !!(await env.WARMAP.get(startKey));
+      console.log("UA rise:", k.id, k.name, "startKey?", alreadyStarted);
 
+      if (!alreadyStarted) {
         const ok = await notifyDiscord(env, {
           keepId: k.id,
           at: payload.updatedAt,
@@ -500,13 +496,18 @@ async function alertOnUnderAttackTransitions(
           });
         }
       }
+
+      // Mark UA state "on" (timestamp value, long TTL)
       await safePutIfChanged(env, prevKey, String(Date.now()), {
         expirationTtl: ttlSec,
       });
       sentHeader++;
     } else if (curr && prev) {
-      // Banner still on. If we somehow missed the rising-edge alert (no startKey), send it now.
-      if (!(await env.WARMAP.get(startKey))) {
+      // Still flaming. If we somehow missed the first alert, send it now.
+      const alreadyStarted = !!(await env.WARMAP.get(startKey));
+      console.log("UA still:", k.id, k.name, "startKey?", alreadyStarted);
+
+      if (!alreadyStarted) {
         const ok = await notifyDiscord(env, {
           keepId: k.id,
           at: payload.updatedAt,
@@ -516,15 +517,14 @@ async function alertOnUnderAttackTransitions(
           await safePutIfChanged(env, startKey, String(Date.now()), {
             expirationTtl: suppressTtl,
           });
-
-          sentHeader++; // count as sent from header
+          sentHeader++;
         }
       } else {
-        // no-op: don't refresh prevKey TTL to reduce KV writes
-        skippedHeader++;
+        skippedHeader++; // no-op; don't spam KV by refreshing prevKey
       }
     } else if (!curr && prev) {
-      // Falling edge: clear state immediately
+      // Falling edge
+      console.log("UA fall:", k.id, k.name);
       await safePutIfChanged(env, prevKey, "0");
       resetHeader++;
     }
@@ -548,9 +548,7 @@ async function alertOnUnderAttackTransitions(
       missing++;
       continue;
     }
-
-    // If banner is visible, header path handles it (or the missed-edge fix above)
-    if (k.headerUnderAttack) continue;
+    if (k.headerUnderAttack) continue; // header path already handles
 
     considered++;
     const key = `alert:ua:nobanner:${ev.keepId}`;
