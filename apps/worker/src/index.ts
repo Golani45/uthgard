@@ -109,18 +109,8 @@ function normText(s: string) {
     .trim();
 }
 
-function headerIsUnderAttack(node: any) {
-  const txt = normText(node.innerText ?? "");
-  if (/\bunder\s*attack\b/.test(txt)) return true;
-  // also accept image-based banners
-  const img = node.querySelector?.(
-    'img[src*="attack"], img[src*="flame"], img[alt*="attack" i]'
-  );
-  return !!img;
-}
-
 function hasUnderAttack(s: string) {
-  return /\bunder\s*attack\b/.test(normText(s));
+  return /\bunder\s+attack\b/.test(normText(s));
 }
 
 // ---- Tiny HTML RP extractor for Worker (no cheerio) ----
@@ -214,7 +204,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const rawHeader = (headerCell?.innerText ?? "").trim();
 
     // seed from header banner
-    const headerSaysUnderAttack = headerIsUnderAttack(headerCell);
+    const headerSaysUnderAttack = hasUnderAttack(rawHeader);
 
     // scan lines for a guild, skipping name/level/emblem/under attack
     const lines = rawHeader
@@ -262,7 +252,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 
   // --- events table (your existing code) ---
   const events: WarmapData["events"] = [];
-  const rows = doc.querySelectorAll("table.TABLE tr");
+  const rows = doc.querySelectorAll("div.keepinfo table.TABLE tr");
 
   const bucketCounts = new Map<string, number>();
   for (const tr of rows) {
@@ -382,84 +372,45 @@ async function notifyDiscord(
   return true;
 }
 
-async function notifyDiscordCapture(
-  env: Environment,
-  ev: { keepName: string; newOwner: Realm; at: string }
-) {
-  const url = env.DISCORD_WEBHOOK_URL;
-  if (!url) return false;
-  const resp = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      username: "Uthgard Herald",
-      embeds: [
-        {
-          title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}`,
-          color: REALM_COLOR[ev.newOwner],
-          timestamp: ev.at,
-          footer: { text: "Uthgard Herald watch" },
-        },
-      ],
-    }),
-  });
-  return resp.ok;
-}
-
 async function alertOnUnderAttackTransitions(
   env: Environment,
   payload: WarmapData
 ) {
-  // 1) Header-based rising edge
+  // 3a) Header-based: one alert per true->false transition
   for (const k of payload.keeps) {
-    const prevKey = `ua:state:${k.id}`;
+    const prevKey = `ua:state:${k.id}`; // '1' while banner up, '0' otherwise
     const prev = (await env.WARMAP.get(prevKey)) === "1";
-    const curr = !!k.headerUnderAttack;
+    const curr = !!k.headerUnderAttack; // <-- banner only
+
     if (curr && !prev) {
       const ok = await notifyDiscord(env, {
         keepId: k.id,
         at: payload.updatedAt,
         keep: k,
       });
-      if (ok) await env.WARMAP.put(prevKey, "1");
+      if (ok) await env.WARMAP.put(prevKey, "1"); // sticky while banner is up
     } else if (!curr && prev) {
-      await env.WARMAP.put(prevKey, "0");
+      await env.WARMAP.put(prevKey, "0"); // banner went down, arm future alerts
     }
   }
 
-  // 2) Fallback: event rows when there is NO banner
-  const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const suppressTtl = windowMin * 60; // seconds
+  // 3b) Fallback: if a keep has NO banner but we do see a fresh “under attack” event,
+  // send exactly once per event timestamp.
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
-
   for (const ev of payload.events) {
     if (ev.kind !== "underAttack") continue;
     const k = byId.get(ev.keepId);
-    if (!k || k.headerUnderAttack) continue; // banner path already handled
-
-    // single alert per keep while it's "under attack" without a banner
-    const key = `alert:ua:nobanner:${ev.keepId}`;
-    if (await env.WARMAP.get(key)) continue;
-
+    if (!k) continue;
+    if (k.headerUnderAttack) continue; // banner path already handled
+    const dedupeKey = `alert:evt:${ev.keepId}:${ev.at}`;
+    if (await env.WARMAP.get(dedupeKey)) continue;
     const ok = await notifyDiscord(env, {
       keepId: ev.keepId,
       at: ev.at,
       keep: k,
     });
-    if (ok) await env.WARMAP.put(key, "1", { expirationTtl: suppressTtl });
-  }
-
-  // 3) Captures (new)
-  for (const ev of payload.events) {
-    if (ev.kind !== "captured" || !ev.newOwner) continue;
-    const capKey = `alert:cap:${ev.keepId}:${ev.at}`;
-    if (await env.WARMAP.get(capKey)) continue;
-    const ok = await notifyDiscordCapture(env, {
-      keepName: ev.keepName,
-      newOwner: ev.newOwner,
-      at: ev.at,
-    });
-    if (ok) await env.WARMAP.put(capKey, "1", { expirationTtl: 2 * 24 * 3600 });
+    if (ok)
+      await env.WARMAP.put(dedupeKey, "1", { expirationTtl: 24 * 60 * 60 });
   }
 }
 
