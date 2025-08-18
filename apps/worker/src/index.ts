@@ -458,6 +458,9 @@ async function alertOnUnderAttackTransitions(
     skippedHeader = 0,
     resetHeader = 0;
 
+  // expire "on" after ~2× your attack window
+  const ttlSec = Number(env.ATTACK_WINDOW_MIN ?? "7") * 120;
+
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
     const prev = (await env.WARMAP.get(prevKey)) === "1";
@@ -471,16 +474,21 @@ async function alertOnUnderAttackTransitions(
         keep: k,
       });
       if (ok) {
-        await env.WARMAP.put(prevKey, "1");
+        // set with TTL so a missed falling edge doesn't wedge it forever
+        await env.WARMAP.put(prevKey, "1", { expirationTtl: ttlSec });
         sentHeader++;
       }
+    } else if (curr && prev) {
+      // refresh TTL while still flaming
+      await env.WARMAP.put(prevKey, "1", { expirationTtl: ttlSec });
+      skippedHeader++;
     } else if (!curr && prev) {
+      // banner went down → clear immediately
       await env.WARMAP.put(prevKey, "0");
       resetHeader++;
-    } else if (curr && prev) {
-      skippedHeader++;
     }
   }
+
   console.log(
     `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
   );
@@ -762,10 +770,10 @@ async function updateWarmap(
   env: Environment,
   opts?: { silent?: boolean }
 ): Promise<WarmapData> {
-  // read previous before fetching the new page (for capture baseline)
+  // Baseline captured once for non-silent comparisons
   const prev = await env.WARMAP.get<WarmapData>("warmap", "json");
 
-  // cache-bust query (changes every 30s)
+  // cache-bust fetch
   const u = new URL(env.HERALD_WARMAP_URL);
   u.searchParams.set("_", String(Math.floor(Date.now() / 30_000)));
 
@@ -773,9 +781,9 @@ async function updateWarmap(
     headers: {
       "user-agent": "UthgardHeraldBot/1.0 (+contact)",
       "cache-control": "no-cache",
-      pragma: "no-cache", // some caches honor this
+      pragma: "no-cache",
     },
-    cf: { cacheTtl: 0, cacheEverything: false }, // Cloudflare hint
+    cf: { cacheTtl: 0, cacheEverything: false },
   });
   if (!res.ok) throw new Error(`Herald ${res.status}`);
 
@@ -785,10 +793,14 @@ async function updateWarmap(
     Number(env.ATTACK_WINDOW_MIN ?? "7")
   );
 
-  if (!opts?.silent) {
-    await alertOnUnderAttackTransitions(env, payload); // rising-edge from banner+fallback
-    await alertOnOwnershipChanges(env, payload, prev ?? null); // once per real owner change
+  if (opts?.silent) {
+    // 👇 do NOT alert or write the baseline
+    return payload;
   }
+
+  // Only cron/admin runs alert logic + persists baseline
+  await alertOnUnderAttackTransitions(env, payload);
+  await alertOnOwnershipChanges(env, payload, prev ?? null);
 
   await env.WARMAP.put("warmap", JSON.stringify(payload));
   return payload;
