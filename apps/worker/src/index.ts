@@ -388,7 +388,7 @@ async function notifyDiscord(
     return false;
   }
 
-  const key = `alert:under:${e.keepId}:${e.at}`; // event-level dedupe
+  const key = `alert:under:${e.keepId}:${e.at}`;
   if (await env.WARMAP.get(key)) {
     console.log("discord: event dedupe", key);
     return false;
@@ -415,14 +415,15 @@ async function notifyDiscord(
   });
 
   if (!resp.ok) {
-    const t = await resp.text().catch(() => "");
-    console.log("discord: webhook failed", resp.status, t);
+    console.log(
+      "discord error",
+      resp.status,
+      await resp.text().catch(() => "...")
+    );
     return false;
   }
-
-  // Discord returns 204 on success
   await env.WARMAP.put(key, "1", { expirationTtl: 6 * 60 * 60 });
-  console.log("discord: webhook ok", resp.status, e.keepId, e.at);
+  console.log("discord sent", e.keepId, e.keep.name, e.at);
   return true;
 }
 
@@ -454,44 +455,72 @@ async function alertOnUnderAttackTransitions(
   env: Environment,
   payload: WarmapData
 ) {
-  // 1) Header-based rising edge
+  let sentHeader = 0,
+    skippedHeader = 0,
+    resetHeader = 0;
+
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
     const prev = (await env.WARMAP.get(prevKey)) === "1";
     const curr = !!k.headerUnderAttack;
+
     if (curr && !prev) {
+      console.log("UA rising:", k.id, k.name);
       const ok = await notifyDiscord(env, {
         keepId: k.id,
         at: payload.updatedAt,
         keep: k,
       });
-      if (ok) await env.WARMAP.put(prevKey, "1");
+      if (ok) {
+        await env.WARMAP.put(prevKey, "1");
+        sentHeader++;
+      }
     } else if (!curr && prev) {
       await env.WARMAP.put(prevKey, "0");
+      resetHeader++;
+    } else if (curr && prev) {
+      skippedHeader++;
     }
   }
+  console.log(
+    `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
+  );
 
-  // 2) Fallback: event rows when there is NO banner
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const suppressTtl = windowMin * 60; // seconds
+  const suppressTtl = windowMin * 60;
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
+  let considered = 0,
+    deduped = 0,
+    sent = 0,
+    missing = 0;
 
   for (const ev of payload.events) {
     if (ev.kind !== "underAttack") continue;
     const k = byId.get(ev.keepId);
-    if (!k || k.headerUnderAttack) continue; // banner path already handled
-
-    // single alert per keep while it's "under attack" without a banner
+    if (!k) {
+      missing++;
+      continue;
+    }
+    if (k.headerUnderAttack) continue;
+    considered++;
     const key = `alert:ua:nobanner:${ev.keepId}`;
-    if (await env.WARMAP.get(key)) continue;
-
+    if (await env.WARMAP.get(key)) {
+      deduped++;
+      continue;
+    }
     const ok = await notifyDiscord(env, {
       keepId: ev.keepId,
       at: ev.at,
       keep: k,
     });
-    if (ok) await env.WARMAP.put(key, "1", { expirationTtl: suppressTtl });
+    if (ok) {
+      await env.WARMAP.put(key, "1", { expirationTtl: suppressTtl });
+      sent++;
+    }
   }
+  console.log(
+    `fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`
+  );
 }
 
 async function getOrUpdateWarmap(
@@ -653,6 +682,53 @@ router.post("/admin/update", async (_req, env: Environment) => {
 router.get("/", () => new Response("OK"));
 router.get("/favicon.ico", () => new Response("", { status: 204 }));
 router.all("*", () => new Response("Not found", { status: 404 }));
+
+// === Add with the other routes ===
+router.get("/admin/peek", async (_req, env: Environment) => {
+  const wm = await env.WARMAP.get<WarmapData>("warmap", "json");
+  if (!wm) return new Response("no warmap", { status: 404 });
+
+  const headerUAs = wm.keeps.filter((k) => k.headerUnderAttack);
+  const uaEvents = wm.events.filter((e) => e.kind === "underAttack");
+
+  // did UA events match a keep id?
+  const ids = new Set(wm.keeps.map((k) => k.id));
+  const unmatched = uaEvents.filter((e) => !ids.has(e.keepId)).slice(0, 10);
+
+  return createJsonResponse({
+    updatedAt: wm.updatedAt,
+    keeps: wm.keeps.length,
+    headerUA_count: headerUAs.length,
+    headerUA_names: headerUAs.map((k) => k.name),
+    uaEvents_count: uaEvents.length,
+    uaEvents_sample: uaEvents
+      .slice(0, 5)
+      .map((e) => ({ keepId: e.keepId, keep: e.keepName, at: e.at })),
+    uaEvents_unmatched_sample: unmatched.map((e) => ({
+      keepId: e.keepId,
+      keep: e.keepName,
+    })),
+  });
+});
+
+router.post("/admin/reset-ua", async (req, env: Environment) => {
+  const url = new URL(req.url);
+  const keepId = url.searchParams.get("keep");
+  if (!keepId) return new Response("missing ?keep=<slug>", { status: 400 });
+  await env.WARMAP.put(`ua:state:${keepId}`, "0");
+  await env.WARMAP.delete(`alert:ua:nobanner:${keepId}`);
+  return new Response(`reset ${keepId}`);
+});
+
+// Reset UA dedupe for a keep (if it got "stuck")
+router.post("/admin/reset-ua", async (req, env: Environment) => {
+  const url = new URL(req.url);
+  const keepId = url.searchParams.get("keep");
+  if (!keepId) return new Response("missing ?keep=<slug>", { status: 400 });
+  await env.WARMAP.put(`ua:state:${keepId}`, "0");
+  await env.WARMAP.delete(`alert:ua:nobanner:${keepId}`);
+  return new Response(`reset ${keepId}`);
+});
 
 async function notifyDiscordPlayer(
   env: Environment,
