@@ -225,14 +225,21 @@ async function postToDiscord(
     return false;
   }
 
+  // Skip sends while we're in cooldown from a previous 429
   if (await discordCooldownActive(env, url)) {
     console.log("discord: cooldown active for", cooldownKeyFor(url));
     return false;
   }
 
+  // Gentle pacing across ALL sends to this webhook URL
+  await enforceWebhookPacing(env, url);
+
   const resp = await fetch(url, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: {
+      "content-type": "application/json",
+      "user-agent": "uthgard-herald-worker",
+    },
     body: JSON.stringify(body),
   });
 
@@ -257,6 +264,9 @@ async function postToDiscord(
     );
     return false;
   }
+
+  // Only record a successful send as the last-send time
+  await noteWebhookSent(env, url);
   return true;
 }
 
@@ -596,10 +606,19 @@ async function alertOnUnderAttackTransitions(
   const ttlSec = windowMin * 240; // UA state "on" TTL
   const suppressTtl = windowMin * 60; // throttle TTL (send once per window)
 
+  // ---------- batch we’ll send at the end ----------
+  type BatchItem = {
+    embed: any;
+    onOk: () => Promise<void>;
+    kind: "header" | "fallback";
+  };
+  const batch: BatchItem[] = [];
+
   // -------- Header-based UA detection (primary path)
   for (const k of payload.keeps) {
     const prevKey = `ua:state:${k.id}`;
     const throttleKey = `alert:ua:header:${k.id}`; // send-once-per-window throttle
+    const dedupeKey = `alert:under:${k.id}:${payload.updatedAt}`; // same as notifyDiscord used
 
     const prevRaw = await env.WARMAP.get(prevKey);
     const prev = !!(prevRaw && prevRaw !== "0");
@@ -620,43 +639,75 @@ async function alertOnUnderAttackTransitions(
     );
 
     if (curr && !prev) {
-      // Rising edge — set state ON and try to send if not throttled
+      // Rising edge — set state ON and queue an embed if not throttled and not deduped
       console.log("UA rise:", k.id, k.name);
-      if (!throttled) {
-        const ok = await notifyDiscord(env, {
-          keepId: k.id,
-          at: payload.updatedAt,
-          keep: k,
+
+      if (!throttled && !(await env.WARMAP.get(dedupeKey))) {
+        const embed = {
+          title: `⚔️ ${k.name} is under attack!`,
+          color: REALM_COLOR[k.owner],
+          fields: [
+            { name: "Owner", value: k.owner, inline: true },
+            { name: "Level", value: String(k.level ?? "—"), inline: true },
+            { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
+          ],
+          timestamp: new Date(payload.updatedAt).toISOString(),
+          footer: { text: "Uthgard Herald watch" },
+          ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
+        };
+
+        batch.push({
+          embed,
+          kind: "header",
+          onOk: async () => {
+            await env.WARMAP.put(throttleKey, "1", {
+              expirationTtl: suppressTtl,
+            });
+            await safePutIfChanged(env, dedupeKey, "1", {
+              expirationTtl: 6 * 60 * 60,
+            });
+            sentHeader++;
+          },
         });
-        if (ok) {
-          await env.WARMAP.put(throttleKey, "1", {
-            expirationTtl: suppressTtl,
-          });
-          sentHeader++;
-        }
       } else {
         skippedHeader++;
       }
 
-      // Mark UA state "on" (timestamp value, long TTL)
+      // Mark UA state "on" (timestamp value, long TTL) regardless of send
       await safePutIfChanged(env, prevKey, String(Date.now()), {
         expirationTtl: ttlSec,
       });
     } else if (curr && prev) {
-      // Still flaming — send once if not throttled
+      // Still flaming — queue once if not throttled and not deduped
       console.log("UA still:", k.id, k.name);
-      if (!throttled) {
-        const ok = await notifyDiscord(env, {
-          keepId: k.id,
-          at: payload.updatedAt,
-          keep: k,
+
+      if (!throttled && !(await env.WARMAP.get(dedupeKey))) {
+        const embed = {
+          title: `⚔️ ${k.name} is under attack!`,
+          color: REALM_COLOR[k.owner],
+          fields: [
+            { name: "Owner", value: k.owner, inline: true },
+            { name: "Level", value: String(k.level ?? "—"), inline: true },
+            { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
+          ],
+          timestamp: new Date(payload.updatedAt).toISOString(),
+          footer: { text: "Uthgard Herald watch" },
+          ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
+        };
+
+        batch.push({
+          embed,
+          kind: "header",
+          onOk: async () => {
+            await env.WARMAP.put(throttleKey, "1", {
+              expirationTtl: suppressTtl,
+            });
+            await safePutIfChanged(env, dedupeKey, "1", {
+              expirationTtl: 6 * 60 * 60,
+            });
+            sentHeader++;
+          },
         });
-        if (ok) {
-          await env.WARMAP.put(throttleKey, "1", {
-            expirationTtl: suppressTtl,
-          });
-          sentHeader++;
-        }
       } else {
         skippedHeader++; // already sent recently
       }
@@ -669,10 +720,6 @@ async function alertOnUnderAttackTransitions(
       resetHeader++;
     }
   }
-
-  console.log(
-    `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
-  );
 
   // -------- Event-based fallback (when header banner isn't visible)
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
@@ -696,26 +743,96 @@ async function alertOnUnderAttackTransitions(
     considered++;
 
     // Dedupe: once per keep per window when there's no banner
-    const key = `alert:ua:nobanner:${ev.keepId}`;
-    if (await env.WARMAP.get(key)) {
+    const nobannerKey = `alert:ua:nobanner:${ev.keepId}`;
+    const dedupeKey = `alert:under:${ev.keepId}:${ev.at}`; // same per-event dedupe used in notifyDiscord
+    if (await env.WARMAP.get(nobannerKey)) {
+      deduped++;
+      continue;
+    }
+    if (await env.WARMAP.get(dedupeKey)) {
       deduped++;
       continue;
     }
 
-    const ok = await notifyDiscord(env, {
-      keepId: ev.keepId,
-      at: ev.at,
-      keep: k,
+    const embed = {
+      title: `⚔️ ${k.name} is under attack!`,
+      color: REALM_COLOR[k.owner],
+      fields: [
+        { name: "Owner", value: k.owner, inline: true },
+        { name: "Level", value: String(k.level ?? "—"), inline: true },
+        { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
+      ],
+      timestamp: new Date(ev.at).toISOString(),
+      footer: { text: "Uthgard Herald watch" },
+      ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
+    };
+
+    batch.push({
+      embed,
+      kind: "fallback",
+      onOk: async () => {
+        await safePutIfChanged(env, nobannerKey, "1", {
+          expirationTtl: suppressTtl,
+        });
+        await safePutIfChanged(env, dedupeKey, "1", {
+          expirationTtl: 6 * 60 * 60,
+        });
+        sent++;
+      },
     });
-    if (ok) {
-      await safePutIfChanged(env, key, "1", { expirationTtl: suppressTtl });
-      sent++;
+  }
+
+  // -------- Send in chunks of 10 embeds ----------
+  if (batch.length > 0 && env.DISCORD_WEBHOOK_URL) {
+    for (let i = 0; i < batch.length; i += 10) {
+      const slice = batch.slice(i, i + 10);
+      const embeds = slice.map((b) => b.embed);
+
+      const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_URL, {
+        username: "Uthgard Herald",
+        embeds,
+      });
+
+      if (ok) {
+        // apply success-side effects (throttles / dedupes / counters)
+        await Promise.all(slice.map((b) => b.onOk()));
+      }
     }
   }
 
   console.log(
+    `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
+  );
+  console.log(
     `fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`
   );
+}
+
+const WEBHOOK_MIN_INTERVAL_MS = 1500; // ~40/min max, under Discord’s 30/min effective cap
+
+function lastSendKeyFor(url: string) {
+  return `discord:last:${cooldownKeyFor(url)}`;
+}
+
+async function enforceWebhookPacing(
+  env: Environment,
+  url: string,
+  minMs = WEBHOOK_MIN_INTERVAL_MS
+) {
+  const k = lastSendKeyFor(url);
+  const lastRaw = await env.WARMAP.get(k);
+  const last = lastRaw ? Number(lastRaw) : 0;
+  const now = Date.now();
+  const wait = last ? minMs - (now - last) : 0;
+  if (wait > 0) {
+    await new Promise((r) => setTimeout(r, wait));
+  }
+}
+
+async function noteWebhookSent(env: Environment, url: string) {
+  await env.WARMAP.put(lastSendKeyFor(url), String(Date.now()), {
+    expirationTtl: 60 * 60,
+  }); // keep for an hour
 }
 
 async function getOrUpdateWarmap(
