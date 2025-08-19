@@ -480,12 +480,25 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
   };
 }
 
-// NEW: alert once per ownership change (rising edge)
+// NEW: alert once per ownership change (rising edge) with recency guard + leader passthrough
 async function alertOnOwnershipChanges(
   env: Environment,
   payload: WarmapData,
   prev: WarmapData | null
 ) {
+  // Build index of the most recent "captured" event per keep (to grab time + leader)
+  const recentCapturedByKeep = new Map<string, Event>();
+  for (const e of payload.events) {
+    if (e.kind !== "captured") continue;
+    const prev = recentCapturedByKeep.get(e.keepId);
+    if (!prev || Date.parse(e.at) > Date.parse(prev.at)) {
+      recentCapturedByKeep.set(e.keepId, e);
+    }
+  }
+
+  // Keep this in sync with the WINDOW_MS in alertOnRecentCapturesFromEvents
+  const CAP_WINDOW_MS = 30 * 60_000;
+
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
 
   for (const k of payload.keeps) {
@@ -494,32 +507,44 @@ async function alertOnOwnershipChanges(
     const baseline = prevKV ?? prevOwnerById.get(k.id) ?? null;
 
     if (baseline == null) {
-      await safePut(env, ownKey, k.owner); // first sighting of this keep
+      // First sighting of this keep: establish baseline only.
+      await safePut(env, ownKey, k.owner);
       continue;
     }
     if (baseline === k.owner) continue; // no change
 
-    // --- NEW: event-level dedupe for this specific transition
-    const transition = `${baseline}->${k.owner}`;
-    const dedupeKey = `cap:${k.id}:${transition}`;
-    if (await env.WARMAP.get(dedupeKey)) {
-      // another invocation already sent this capture
+    // We saw an owner flip; only alert if we also have a *recent* captured event.
+    const ev = recentCapturedByKeep.get(k.id);
+    const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
+
+    if (!evFresh) {
+      // Owner changed but no fresh capture event → update baseline silently to avoid stale pings.
+      await safePut(env, ownKey, k.owner);
       continue;
     }
 
+    // Dedupe: this specific transition
+    const transition = `${baseline}->${k.owner}`;
+    const dedupeKey = `cap:${k.id}:${transition}`;
+    if (await env.WARMAP.get(dedupeKey)) continue;
+
+    // "Once per keep+newOwner within TTL"
     const onceKey = capOnceKey(k.id, k.owner);
     if (await env.WARMAP.get(onceKey)) continue;
 
+    // Send capture with the event's timestamp and leader (if any)
     const ok = await notifyDiscordCapture(env, {
       keepName: k.name,
       newOwner: k.owner,
-      at: payload.updatedAt,
+      at: ev.at,
+      leader: ev.leader, // <- include leader in title if you adopted the header change
     });
+
     if (ok) {
       await Promise.all([
-        safePut(env, ownKey, k.owner),
+        safePut(env, ownKey, k.owner), // move baseline forward
         safePut(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
-        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // keep your transition key if you want
+        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // transition-level dedupe
       ]);
     }
   }
@@ -572,18 +597,13 @@ async function notifyDiscordCapture(
   ev: { keepName: string; newOwner: Realm; at: string; leader?: string }
 ) {
   const url = env.DISCORD_WEBHOOK_CAPTURE;
-  const fields = ev.leader
-    ? [{ name: "Led by", value: ev?.leader, inline: true }]
-    : [];
-
+  const leaderSuffix = ev.leader ? ` — led by ${ev.leader}` : "";
   const embed = {
-    title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}`,
+    title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}${leaderSuffix}`,
     color: REALM_COLOR[ev.newOwner],
     timestamp: ev.at,
     footer: { text: "Uthgard Herald watch" },
-    ...(fields.length ? { fields } : {}),
   };
-
   return await postToDiscord(env, url!, {
     username: "Uthgard Herald",
     embeds: [embed],
@@ -1037,7 +1057,6 @@ router.get("/admin/test-capture", async (req, env: Environment) => {
     keepName: keep,
     newOwner: realm,
     at: new Date().toISOString(),
-    leader: ev.leader, // <- add this
   });
   return createJsonResponse({ ok, keep, realm });
 });
