@@ -30,6 +30,7 @@ type Event = {
   guild?: string; // for claimed
   level?: number; // for upgraded
   raw?: string;
+  leader?: string;
 };
 
 // Discord embed color per realm (integer, not hex string)
@@ -426,11 +427,12 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     const at = relToIsoBucketed(when, bucketCounts);
 
     let m = text.match(
-      /^(.+?) (?:has been|was)\s+captured by (?:the\s+forces\s+of\s+)?(Albion|Midgard|Hibernia)/i
+      /^(.+?) (?:has been|was)\s+captured by (?:the\s+forces\s+of\s+)?(Albion|Midgard|Hibernia)(?:\s+led\s+by\s+(.+))?/i
     );
     if (m) {
       const keepName = m[1].trim();
       const newOwner = m[2] as Realm;
+      const leader = m[3]?.trim() ?? null;
       events.push({
         at,
         kind: "captured",
@@ -438,7 +440,8 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
         keepName,
         newOwner,
         raw: text,
-      });
+        ...(leader ? { leader } : {}),
+      } as Event & { leader?: string });
       continue;
     }
     m = text.match(/^(.+?) (?:is|was) under attack/i);
@@ -566,15 +569,21 @@ async function notifyDiscord(
 //keep capture
 async function notifyDiscordCapture(
   env: Environment,
-  ev: { keepName: string; newOwner: Realm; at: string }
+  ev: { keepName: string; newOwner: Realm; at: string; leader?: string }
 ) {
   const url = env.DISCORD_WEBHOOK_CAPTURE;
+  const fields = ev.leader
+    ? [{ name: "Led by", value: ev?.leader, inline: true }]
+    : [];
+
   const embed = {
     title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}`,
     color: REALM_COLOR[ev.newOwner],
     timestamp: ev.at,
     footer: { text: "Uthgard Herald watch" },
+    ...(fields.length ? { fields } : {}),
   };
+
   return await postToDiscord(env, url!, {
     username: "Uthgard Herald",
     embeds: [embed],
@@ -924,6 +933,12 @@ async function checkTrackedPlayers(env: Environment, onlyId?: string) {
         } else if (rp > prev) {
           // gained RPs since last tick
           const isActive = !!(await env.WARMAP.get(activeKey));
+          console.log(
+            `RP gain for ${p.id}: +${rp - prev}${
+              isActive ? " (session active)" : ""
+            }`
+          );
+
           if (!isActive) {
             const ok = await notifyDiscordPlayer(env, p, rp - prev);
             if (ok) {
@@ -933,21 +948,13 @@ async function checkTrackedPlayers(env: Environment, onlyId?: string) {
               });
             }
           } else {
-            // still active — refresh the session window
-            await safePutIfChanged(env, activeKey, "1", {
-              expirationTtl: sessionMin * 60,
-            });
+            // DO NOT refresh the TTL here.
+            // Let the active session expire so we can alert again after ~20 min.
           }
           // update baseline to the new total
           await safePutIfChanged(env, rpKey, String(rp));
         } else {
-          // equal RPs; if already in a session, refresh the TTL
-          const isActive = !!(await env.WARMAP.get(activeKey));
-          if (isActive) {
-            await safePutIfChanged(env, activeKey, "1", {
-              expirationTtl: sessionMin * 60,
-            });
-          }
+          // equal RPs — do nothing so the session can naturally expire
         }
       }
     } catch (e: any) {
@@ -1030,6 +1037,7 @@ router.get("/admin/test-capture", async (req, env: Environment) => {
     keepName: keep,
     newOwner: realm,
     at: new Date().toISOString(),
+    leader: ev.leader, // <- add this
   });
   return createJsonResponse({ ok, keep, realm });
 });
@@ -1370,6 +1378,7 @@ async function alertOnRecentCapturesFromEvents(
       keepName: ev.keepName,
       newOwner: ev.newOwner!,
       at: ev.at,
+      leader: ev.leader,
     });
     if (ok) {
       await Promise.all([
