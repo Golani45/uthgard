@@ -591,7 +591,7 @@ async function notifyDiscord(
   return ok;
 }
 
-//keep capture
+//keep capture.
 async function notifyDiscordCapture(
   env: Environment,
   ev: { keepName: string; newOwner: Realm; at: string; leader?: string }
