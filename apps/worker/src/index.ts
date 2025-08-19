@@ -11,6 +11,7 @@ interface Environment {
   DISCORD_WEBHOOK_CAPTURE?: string; // capture activity
   TRACKED_PLAYERS?: string; // ⬅️ stringified JSON
   ACTIVITY_SESSION_MIN?: string; // ⬅️ minutes to treat as one "session" (default 30)
+  CAPTURE_WINDOW_MIN?: string; // how recent a "captured" can be to alert (default 12)
 }
 
 type Event = {
@@ -157,6 +158,11 @@ function parseRelative(s: string): { ms: number; bucket: string } {
   return { ms, bucket: `${n}${u}` };
 }
 
+function captureWindowMs(env: Environment) {
+  const min = Number(env.CAPTURE_WINDOW_MIN ?? "12"); // pick your default
+  return Math.max(1, min) * 60_000;
+}
+
 function parseDfOwner(doc: ReturnType<typeof parse>): Realm {
   // Be liberal: look for any image in the DF panel and infer by filename
   const img = doc.querySelector('img[src*="df"], img[alt*="Darkness Falls" i]');
@@ -213,6 +219,32 @@ async function setDiscordCooldown(env: Environment, url: string, secs: number) {
   const key = cooldownKeyFor(url);
   const until = new Date(Date.now() + secs * 1000).toISOString();
   await env.WARMAP.put(key, until, { expirationTtl: Math.ceil(secs) + 1 });
+}
+
+function capSeenKey(keepId: string, owner: Realm) {
+  return `cap:seen:${keepId}:${owner}`;
+}
+
+async function hasAlertedCapture(
+  env: Environment,
+  keepId: string,
+  owner: Realm,
+  atIso: string
+) {
+  const k = capSeenKey(keepId, owner);
+  const seenAt = await env.WARMAP.get(k);
+  if (!seenAt) return false;
+  return Date.parse(seenAt) >= Date.parse(atIso);
+}
+
+async function markCaptureAlerted(
+  env: Environment,
+  keepId: string,
+  owner: Realm,
+  atIso: string
+) {
+  // no TTL on purpose (persists until overwritten by a newer capture)
+  await safePutIfChanged(env, capSeenKey(keepId, owner), atIso);
 }
 
 function parseRetryAfter(resp: Response): number {
@@ -496,9 +528,6 @@ async function alertOnOwnershipChanges(
     }
   }
 
-  // Keep this in sync with the WINDOW_MS in alertOnRecentCapturesFromEvents
-  const CAP_WINDOW_MS = 30 * 60_000;
-
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
 
   for (const k of payload.keeps) {
@@ -513,6 +542,8 @@ async function alertOnOwnershipChanges(
     }
     if (baseline === k.owner) continue; // no change
 
+    const CAP_WINDOW_MS = captureWindowMs(env);
+
     // We saw an owner flip; only alert if we also have a *recent* captured event.
     const ev = recentCapturedByKeep.get(k.id);
     const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
@@ -520,6 +551,12 @@ async function alertOnOwnershipChanges(
     if (!evFresh) {
       // Owner changed but no fresh capture event → update baseline silently to avoid stale pings.
       await safePut(env, ownKey, k.owner);
+      continue;
+    }
+
+    // NEW: persistent seen gate (prevents “same capture, later tick”)
+    if (await hasAlertedCapture(env, k.id, k.owner, ev.at)) {
+      await safePut(env, ownKey, k.owner); // still move baseline
       continue;
     }
 
@@ -542,9 +579,9 @@ async function alertOnOwnershipChanges(
 
     if (ok) {
       await Promise.all([
-        safePut(env, ownKey, k.owner), // move baseline forward
-        safePut(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
-        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // transition-level dedupe
+        safePut(env, ownKey, k.owner),
+        markCaptureAlerted(env, k.id, k.owner, ev.at),
+        safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
       ]);
     }
   }
@@ -1378,13 +1415,16 @@ async function alertOnRecentCapturesFromEvents(
   payload: WarmapData
 ) {
   const now = Date.now();
-  const WINDOW_MS = 30 * 60_000; // last 30 minutes
+  const WINDOW_MS = captureWindowMs(env);
 
   for (const ev of payload.events) {
     if (ev.kind !== "captured") continue;
 
     const atMs = Date.parse(ev.at);
     if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
+
+    // NEW: persistent seen gate
+    if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!, ev.at)) continue;
 
     // unified dedupe (shared with ownership-change path)
     const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at);
@@ -1401,9 +1441,7 @@ async function alertOnRecentCapturesFromEvents(
     });
     if (ok) {
       await Promise.all([
-        safePutIfChanged(env, onceKey, "1", {
-          expirationTtl: CAP_ONCE_TTL_SEC,
-        }),
+        markCaptureAlerted(env, ev.keepId, ev.newOwner!, ev.at), // <-- NEW
         safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
       ]);
     }
