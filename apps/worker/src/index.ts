@@ -164,7 +164,7 @@ function captureWindowMs(env: Environment) {
 }
 
 function parseDfOwner(doc: ReturnType<typeof parse>): Realm {
-  // Be liberal: look for any image in the DF panel and infer by filename
+  // Be liberal: look for any image in the DF panel and infer by filename.
   const img = doc.querySelector('img[src*="df"], img[alt*="Darkness Falls" i]');
   const src = img?.getAttribute("src")?.toLowerCase() ?? "";
   if (src.includes("alb")) return "Albion";
