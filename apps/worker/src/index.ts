@@ -184,7 +184,7 @@ function packForHash(wm: WarmapData) {
 function headerHasUAImage(node: any): boolean {
   if (!node?.querySelector) return false;
 
-  // Be strict: do NOT match plain "under" anywhere.
+  // Be strict: do NOT match plain "under" anywhere
   // Only match clear UA banner / flame image patterns.
   const selector = [
     // explicit alt text
