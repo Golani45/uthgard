@@ -504,20 +504,28 @@ async function alertOnOwnershipChanges(
       continue;
     }
 
+    const onceKey = capOnceKey(k.id, k.owner);
+    if (await env.WARMAP.get(onceKey)) continue;
+
     const ok = await notifyDiscordCapture(env, {
       keepName: k.name,
       newOwner: k.owner,
       at: payload.updatedAt,
     });
-
     if (ok) {
       await Promise.all([
-        safePut(env, ownKey, k.owner), // persist new owner
-        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // 15-min dedupe
+        safePut(env, ownKey, k.owner),
+        safePut(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
+        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // keep your transition key if you want
       ]);
     }
   }
 }
+
+function capOnceKey(keepId: string, newOwner: Realm) {
+  return `cap:once:${keepId}:${newOwner}`;
+}
+const CAP_ONCE_TTL_SEC = 20 * 60; // 20 minutes
 
 const EMBED_FOOTER = { text: "Uthgard Herald watch" };
 // If you have a small square avatar to show on the webhook bot:
@@ -1355,14 +1363,21 @@ async function alertOnRecentCapturesFromEvents(
     const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at);
     if (await env.WARMAP.get(kAny)) continue;
 
+    const onceKey = capOnceKey(ev.keepId, ev.newOwner!);
+    if (await env.WARMAP.get(onceKey)) continue;
+
     const ok = await notifyDiscordCapture(env, {
       keepName: ev.keepName,
-      newOwner: ev.newOwner!, // guaranteed for "captured"
+      newOwner: ev.newOwner!,
       at: ev.at,
     });
-
     if (ok) {
-      await safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 });
+      await Promise.all([
+        safePutIfChanged(env, onceKey, "1", {
+          expirationTtl: CAP_ONCE_TTL_SEC,
+        }),
+        safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
+      ]);
     }
   }
 }
