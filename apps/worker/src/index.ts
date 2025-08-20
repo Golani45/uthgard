@@ -696,10 +696,9 @@ async function alertOnUnderAttackTransitions(
     resetHeader = 0;
 
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const ttlSec = windowMin * 240; // UA state "on" TTL
-  const suppressTtl = windowMin * 60; // throttle TTL (send once per window)
+  const ttlSec = windowMin * 240; // UA state "on" TTL (longer than the parse window)
+  const suppressTtl = windowMin * 60; // kept for fallback path; header path won’t use it to resend
 
-  // ---------- batch we’ll send at the end ----------
   type BatchItem = {
     embed: any;
     onOk: () => Promise<void>;
@@ -709,15 +708,16 @@ async function alertOnUnderAttackTransitions(
 
   // -------- Header-based UA detection (primary path)
   for (const k of payload.keeps) {
-    const prevKey = `ua:state:${k.id}`;
-    const throttleKey = `alert:ua:header:${k.id}`; // send-once-per-window throttle
-    const dedupeKey = `alert:under:${k.id}:${payload.updatedAt}`; // same as notifyDiscord used
+    const prevKey = `ua:state:${k.id}`; // boolean-ish: "0" or timestamp
+    const sessionKey = `alert:ua:start:${k.id}`; // <-- NEW: one-per-siege flag
+    const dedupeKey = `alert:under:${k.id}:${payload.updatedAt}`;
 
     const prevRaw = await env.WARMAP.get(prevKey);
     const prev = !!(prevRaw && prevRaw !== "0");
     const curr = !!k.headerUnderAttack;
-    const throttled = !!(await env.WARMAP.get(throttleKey));
+    const hasSession = !!(await env.WARMAP.get(sessionKey));
 
+    // Trace
     console.log(
       JSON.stringify({
         tag: "UA_TRACE",
@@ -725,17 +725,14 @@ async function alertOnUnderAttackTransitions(
         name: k.name,
         curr,
         prev,
-        throttled,
+        hasSession,
         prevRaw,
-        throttleKey,
       })
     );
 
     if (curr && !prev) {
-      // Rising edge — set state ON and queue an embed if not throttled and not deduped
-      console.log("UA rise:", k.id, k.name);
-
-      if (!throttled && !(await env.WARMAP.get(dedupeKey))) {
+      // Rising edge
+      if (!hasSession && !(await env.WARMAP.get(dedupeKey))) {
         const embed = {
           title: `⚔️ ${k.name} is under attack!`,
           color: REALM_COLOR[k.owner],
@@ -753,68 +750,52 @@ async function alertOnUnderAttackTransitions(
           embed,
           kind: "header",
           onOk: async () => {
-            await env.WARMAP.put(throttleKey, "1", {
-              expirationTtl: suppressTtl,
+            // Mark “one-per-siege” and per-event dedupe
+            await safePutIfChanged(env, sessionKey, "1", {
+              expirationTtl: ttlSec,
             });
             await safePutIfChanged(env, dedupeKey, "1", {
               expirationTtl: 6 * 60 * 60,
             });
+
+            // Mark UA state “on” and keep it alive for a long time
+            await safePutIfChanged(env, prevKey, String(Date.now()), {
+              expirationTtl: ttlSec,
+            });
+
             sentHeader++;
           },
         });
       } else {
+        // Already in-session or deduped for this payload — don’t send
         skippedHeader++;
+        // Still ensure UA state stays "on"
+        await safePutIfChanged(env, prevKey, String(Date.now()), {
+          expirationTtl: ttlSec,
+        });
       }
-
-      // Mark UA state "on" (timestamp value, long TTL) regardless of send
+    } else if (curr && prev) {
+      // Still flaming — DO NOT send again.
+      // Just keep the UA “on” state (and optionally the session flag) fresh so TTLs don’t expire mid-siege.
       await safePutIfChanged(env, prevKey, String(Date.now()), {
         expirationTtl: ttlSec,
       });
-    } else if (curr && prev) {
-      // Still flaming — queue once if not throttled and not deduped
-      console.log("UA still:", k.id, k.name);
-
-      if (!throttled && !(await env.WARMAP.get(dedupeKey))) {
-        const embed = {
-          title: `⚔️ ${k.name} is under attack!`,
-          color: REALM_COLOR[k.owner],
-          fields: [
-            { name: "Owner", value: k.owner, inline: true },
-            { name: "Level", value: String(k.level ?? "—"), inline: true },
-            { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
-          ],
-          timestamp: new Date(payload.updatedAt).toISOString(),
-          footer: { text: "Uthgard Herald watch" },
-          ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
-        };
-
-        batch.push({
-          embed,
-          kind: "header",
-          onOk: async () => {
-            await env.WARMAP.put(throttleKey, "1", {
-              expirationTtl: suppressTtl,
-            });
-            await safePutIfChanged(env, dedupeKey, "1", {
-              expirationTtl: 6 * 60 * 60,
-            });
-            sentHeader++;
-          },
-        });
-      } else {
-        skippedHeader++; // already sent recently
+      if (hasSession) {
+        await safePutIfChanged(env, sessionKey, "1", { expirationTtl: ttlSec });
       }
+      skippedHeader++;
     } else if (!curr && prev) {
-      // Falling edge
-      console.log("UA fall:", k.id, k.name);
+      // Falling edge — end the session and clear UA state
       await safePutIfChanged(env, prevKey, "0");
-      // Optional: clear throttle immediately so a brand-new flame can alert right away
-      // await safeDelete(env, throttleKey);
+      await safeDelete(env, sessionKey);
+      // Also clear the header throttle (if you ever set it elsewhere)
+      await safeDelete(env, `alert:ua:header:${k.id}`);
       resetHeader++;
     }
   }
 
   // -------- Event-based fallback (when header banner isn't visible)
+  // (This stays the same except for the throttle: we keep the once-per-window behavior here)
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
   let considered = 0,
     deduped = 0,
@@ -830,14 +811,13 @@ async function alertOnUnderAttackTransitions(
       continue;
     }
 
-    // If header already shows a flame, the header path handled it.
+    // If header already shows a flame, header path governs sessioning
     if (k.headerUnderAttack) continue;
 
     considered++;
 
-    // Dedupe: once per keep per window when there's no banner
     const nobannerKey = `alert:ua:nobanner:${ev.keepId}`;
-    const dedupeKey = `alert:under:${ev.keepId}:${ev.at}`; // same per-event dedupe used in notifyDiscord
+    const dedupeKey = `alert:under:${ev.keepId}:${ev.at}`;
     if (await env.WARMAP.get(nobannerKey)) {
       deduped++;
       continue;
@@ -885,11 +865,7 @@ async function alertOnUnderAttackTransitions(
         username: "Uthgard Herald",
         embeds,
       });
-
-      if (ok) {
-        // apply success-side effects (throttles / dedupes / counters)
-        await Promise.all(slice.map((b) => b.onOk()));
-      }
+      if (ok) await Promise.all(slice.map((b) => b.onOk()));
     }
   }
 
