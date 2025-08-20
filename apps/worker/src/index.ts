@@ -228,25 +228,19 @@ function capSeenKey(keepId: string, owner: Realm) {
 async function hasAlertedCapture(
   env: Environment,
   keepId: string,
-  owner: Realm,
-  atIso: string
+  owner: Realm
 ) {
-  const k = capSeenKey(keepId, owner);
-  const seenAt = await env.WARMAP.get(k);
-  if (!seenAt) return false;
-  return Date.parse(seenAt) >= Date.parse(atIso);
+  return !!(await env.WARMAP.get(capSeenKey(keepId, owner)));
 }
-
 async function markCaptureAlerted(
   env: Environment,
   keepId: string,
-  owner: Realm,
-  atIso: string
+  owner: Realm
 ) {
-  // no TTL on purpose (persists until overwritten by a newer capture)
-  await safePutIfChanged(env, capSeenKey(keepId, owner), atIso);
+  await safePutIfChanged(env, capSeenKey(keepId, owner), "1", {
+    expirationTtl: CAP_ONCE_TTL_SEC,
+  });
 }
-
 function parseRetryAfter(resp: Response): number {
   const ra =
     resp.headers.get("Retry-After") ??
@@ -513,6 +507,7 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 }
 
 // NEW: alert once per ownership change (rising edge) with recency guard + leader passthrough
+// --- alert when ownership flips (rising edge), with Fix A once-per keep+owner gate
 async function alertOnOwnershipChanges(
   env: Environment,
   payload: WarmapData,
@@ -544,44 +539,45 @@ async function alertOnOwnershipChanges(
 
     const CAP_WINDOW_MS = captureWindowMs(env);
 
-    // We saw an owner flip; only alert if we also have a *recent* captured event.
+    // Most recent capture event for this keep
     const ev = recentCapturedByKeep.get(k.id);
     const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
 
     if (!evFresh) {
-      // Owner changed but no fresh capture event → update baseline silently to avoid stale pings.
+      // Owner changed but no fresh capture event → update baseline silently
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    // NEW: persistent seen gate (prevents “same capture, later tick”)
-    if (await hasAlertedCapture(env, k.id, k.owner, ev.at)) {
-      await safePut(env, ownKey, k.owner); // still move baseline
+    // ---------------- FIX A: strong once-per keep+newOwner TTL gate ----------------
+    const onceKey = capOnceKey(k.id, k.owner);
+    if (await env.WARMAP.get(onceKey)) {
+      await safePut(env, ownKey, k.owner); // still move baseline forward
       continue;
     }
+    // -----------------------------------------------------------------------------
 
-    // Dedupe: this specific transition
+    // Dedupe this specific transition briefly (extra belt)
     const transition = `${baseline}->${k.owner}`;
     const dedupeKey = `cap:${k.id}:${transition}`;
     if (await env.WARMAP.get(dedupeKey)) continue;
 
-    // "Once per keep+newOwner within TTL"
-    const onceKey = capOnceKey(k.id, k.owner);
-    if (await env.WARMAP.get(onceKey)) continue;
-
-    // Send capture with the event's timestamp and leader (if any)
+    // Send capture with the event's timestamp and optional leader
     const ok = await notifyDiscordCapture(env, {
       keepName: k.name,
       newOwner: k.owner,
       at: ev.at,
-      leader: ev.leader, // <- include leader in title if you adopted the header change
+      leader: (ev as any).leader,
     });
 
     if (ok) {
       await Promise.all([
         safePut(env, ownKey, k.owner),
-        markCaptureAlerted(env, k.id, k.owner, ev.at),
+        markCaptureAlerted(env, k.id, k.owner),
         safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
+        safePutIfChanged(env, onceKey, "1", {
+          expirationTtl: CAP_ONCE_TTL_SEC,
+        }),
       ]);
     }
   }
@@ -1410,6 +1406,8 @@ async function safeDelete(env: Environment, key: string) {
   }
 }
 
+// --- alert from recent "captured" rows, with Fix A once-per keep+owner gate
+// --- alert from recent "captured" rows, with Fix A once-per keep+owner gate
 async function alertOnRecentCapturesFromEvents(
   env: Environment,
   payload: WarmapData
@@ -1423,30 +1421,37 @@ async function alertOnRecentCapturesFromEvents(
     const atMs = Date.parse(ev.at);
     if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
 
-    // NEW: persistent seen gate
-    if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!, ev.at)) continue;
+    // ---------------- FIX A: strong once-per keep+newOwner TTL gate ----------------
+    const onceKey = capOnceKey(ev.keepId, ev.newOwner!);
+    if (await env.WARMAP.get(onceKey)) continue;
+    // -----------------------------------------------------------------------------
 
-    // unified dedupe (shared with ownership-change path)
+    // unified per-minute dedupe (keeps dupes within same minute down)
     const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at);
     if (await env.WARMAP.get(kAny)) continue;
 
-    const onceKey = capOnceKey(ev.keepId, ev.newOwner!);
-    if (await env.WARMAP.get(onceKey)) continue;
+    // legacy "already seen" guard (kept as extra belt)
+    if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!)) continue;
 
     const ok = await notifyDiscordCapture(env, {
       keepName: ev.keepName,
       newOwner: ev.newOwner!,
       at: ev.at,
-      leader: ev.leader,
+      leader: (ev as any).leader,
     });
+
     if (ok) {
       await Promise.all([
-        markCaptureAlerted(env, ev.keepId, ev.newOwner!, ev.at), // <-- NEW
+        markCaptureAlerted(env, ev.keepId, ev.newOwner!),
         safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
+        safePutIfChanged(env, onceKey, "1", {
+          expirationTtl: CAP_ONCE_TTL_SEC,
+        }),
       ]);
     }
   }
 }
+
 async function updateWarmap(
   env: Environment,
   opts?: { silent?: boolean; store?: boolean }
