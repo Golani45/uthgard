@@ -502,12 +502,13 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
     updatedAt: new Date().toISOString(),
     keeps,
     dfOwner: parseDfOwner(doc),
-    events: events.slice(0, 50),
+    events: events.slice(0, 200),
   };
 }
 
 // NEW: alert once per ownership change (rising edge) with recency guard + leader passthrough
 // --- alert when ownership flips (rising edge), with Fix A once-per keep+owner gate
+// --- alert when ownership flips (rising edge), with transition-scoped once gate
 async function alertOnOwnershipChanges(
   env: Environment,
   payload: WarmapData,
@@ -517,52 +518,57 @@ async function alertOnOwnershipChanges(
   const recentCapturedByKeep = new Map<string, Event>();
   for (const e of payload.events) {
     if (e.kind !== "captured") continue;
-    const prev = recentCapturedByKeep.get(e.keepId);
-    if (!prev || Date.parse(e.at) > Date.parse(prev.at)) {
+    const prior = recentCapturedByKeep.get(e.keepId);
+    if (!prior || Date.parse(e.at) > Date.parse(prior.at)) {
       recentCapturedByKeep.set(e.keepId, e);
     }
   }
 
+  // Previous owners from last snapshot (fallback for first baseline)
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
 
   for (const k of payload.keeps) {
     const ownKey = `own:${k.id}`;
     const prevKV = await env.WARMAP.get(ownKey);
-    const baseline = prevKV ?? prevOwnerById.get(k.id) ?? null;
+    const baseline = (prevKV ?? prevOwnerById.get(k.id)) as Realm | null;
 
     if (baseline == null) {
-      // First sighting of this keep: establish baseline only.
+      // First sighting — establish baseline, no alert.
       await safePut(env, ownKey, k.owner);
       continue;
     }
-    if (baseline === k.owner) continue; // no change
 
+    if (baseline === k.owner) {
+      // No owner change.
+      continue;
+    }
+
+    // Require a "fresh" captured row to avoid stale flips
     const CAP_WINDOW_MS = captureWindowMs(env);
-
-    // Most recent capture event for this keep
     const ev = recentCapturedByKeep.get(k.id);
     const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
 
     if (!evFresh) {
-      // Owner changed but no fresh capture event → update baseline silently
+      // Owner changed but we didn't see a fresh captured line — move baseline silently.
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    // ---------------- FIX A: strong once-per keep+newOwner TTL gate ----------------
-    const onceKey = capOnceKey(k.id, k.owner);
-    if (await env.WARMAP.get(onceKey)) {
-      await safePut(env, ownKey, k.owner); // still move baseline forward
+    // -------- TRANSITION once-gate (Albion->Hibernia differs from Hibernia->Albion)
+    const transitionOnceKey = capOnceTransitionKey(k.id, baseline, k.owner);
+    if (await env.WARMAP.get(transitionOnceKey)) {
+      await safePut(env, ownKey, k.owner); // still advance baseline
       continue;
     }
-    // -----------------------------------------------------------------------------
 
-    // Dedupe this specific transition briefly (extra belt)
+    // Short-term dedupe for this specific transition (extra belt & suspenders)
     const transition = `${baseline}->${k.owner}`;
     const dedupeKey = `cap:${k.id}:${transition}`;
-    if (await env.WARMAP.get(dedupeKey)) continue;
+    if (await env.WARMAP.get(dedupeKey)) {
+      continue;
+    }
 
-    // Send capture with the event's timestamp and optional leader
+    // Send capture alert using the event timestamp (+ leader if parsed)
     const ok = await notifyDiscordCapture(env, {
       keepName: k.name,
       newOwner: k.owner,
@@ -572,15 +578,24 @@ async function alertOnOwnershipChanges(
 
     if (ok) {
       await Promise.all([
-        safePut(env, ownKey, k.owner),
-        markCaptureAlerted(env, k.id, k.owner),
-        safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
-        safePutIfChanged(env, onceKey, "1", {
+        safePut(env, ownKey, k.owner), // advance baseline
+        markCaptureAlerted(env, k.id, k.owner), // simple TTL "seen" flag
+        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // 15 min
+        // transition-scoped once gate (20 min by your CAP_ONCE_TTL_SEC)
+        safePutIfChanged(env, transitionOnceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
       ]);
     }
   }
+}
+
+function capOnceTransitionKey(
+  keepId: string,
+  prevOwner: Realm,
+  newOwner: Realm
+) {
+  return `cap:once:${keepId}:${prevOwner}->${newOwner}`;
 }
 
 function capOnceKey(keepId: string, newOwner: Realm) {
