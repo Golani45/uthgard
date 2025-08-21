@@ -514,7 +514,6 @@ async function alertOnOwnershipChanges(
   payload: WarmapData,
   prev: WarmapData | null
 ) {
-  // Build index of the most recent "captured" event per keep (to grab time + leader)
   const recentCapturedByKeep = new Map<string, Event>();
   for (const e of payload.events) {
     if (e.kind !== "captured") continue;
@@ -524,7 +523,6 @@ async function alertOnOwnershipChanges(
     }
   }
 
-  // Previous owners from last snapshot (fallback for first baseline)
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
 
   for (const k of payload.keeps) {
@@ -533,42 +531,35 @@ async function alertOnOwnershipChanges(
     const baseline = (prevKV ?? prevOwnerById.get(k.id)) as Realm | null;
 
     if (baseline == null) {
-      // First sighting — establish baseline, no alert.
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
     if (baseline === k.owner) {
-      // No owner change.
       continue;
     }
 
-    // Require a "fresh" captured row to avoid stale flips
     const CAP_WINDOW_MS = captureWindowMs(env);
     const ev = recentCapturedByKeep.get(k.id);
     const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
 
     if (!evFresh) {
-      // Owner changed but we didn't see a fresh captured line — move baseline silently.
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    // -------- TRANSITION once-gate (Albion->Hibernia differs from Hibernia->Albion)
     const transitionOnceKey = capOnceTransitionKey(k.id, baseline, k.owner);
     if (await env.WARMAP.get(transitionOnceKey)) {
-      await safePut(env, ownKey, k.owner); // still advance baseline
+      await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    // Short-term dedupe for this specific transition (extra belt & suspenders)
     const transition = `${baseline}->${k.owner}`;
     const dedupeKey = `cap:${k.id}:${transition}`;
     if (await env.WARMAP.get(dedupeKey)) {
       continue;
     }
 
-    // Send capture alert using the event timestamp (+ leader if parsed)
     const ok = await notifyDiscordCapture(env, {
       keepName: k.name,
       newOwner: k.owner,
@@ -578,13 +569,14 @@ async function alertOnOwnershipChanges(
 
     if (ok) {
       await Promise.all([
-        safePut(env, ownKey, k.owner), // advance baseline
-        markCaptureAlerted(env, k.id, k.owner), // simple TTL "seen" flag
-        safePut(env, dedupeKey, "1", { expirationTtl: 900 }), // 15 min
-        // transition-scoped once gate (20 min by your CAP_ONCE_TTL_SEC)
+        safePut(env, ownKey, k.owner),
+        markCaptureAlerted(env, k.id, k.owner),
+        safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
         safePutIfChanged(env, transitionOnceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
+        safeDelete(env, `alert:ua:start:${k.id}`), // NEW: end UA session on capture
+        safePutIfChanged(env, `ua:state:${k.id}`, "0"), // NEW: clear UA "on" state
       ]);
     }
   }
@@ -696,8 +688,8 @@ async function alertOnUnderAttackTransitions(
     resetHeader = 0;
 
   const windowMin = Number(env.ATTACK_WINDOW_MIN ?? "7");
-  const ttlSec = windowMin * 240; // UA state "on" TTL (longer than the parse window)
-  const suppressTtl = windowMin * 60; // kept for fallback path; header path won’t use it to resend
+  const ttlSec = windowMin * 240; // UA “on” TTL — long enough for a siege
+  const suppressTtl = windowMin * 60; // per-window dedupe for fallback
 
   type BatchItem = {
     embed: any;
@@ -706,10 +698,10 @@ async function alertOnUnderAttackTransitions(
   };
   const batch: BatchItem[] = [];
 
-  // -------- Header-based UA detection (primary path)
+  // ---------- HEADER PATH (primary & reliable) ----------
   for (const k of payload.keeps) {
-    const prevKey = `ua:state:${k.id}`; // boolean-ish: "0" or timestamp
-    const sessionKey = `alert:ua:start:${k.id}`; // <-- NEW: one-per-siege flag
+    const prevKey = `ua:state:${k.id}`; // “on” state (timestamp or "0")
+    const sessionKey = `alert:ua:start:${k.id}`; // one-per-siege
     const dedupeKey = `alert:under:${k.id}:${payload.updatedAt}`;
 
     const prevRaw = await env.WARMAP.get(prevKey);
@@ -717,21 +709,8 @@ async function alertOnUnderAttackTransitions(
     const curr = !!k.headerUnderAttack;
     const hasSession = !!(await env.WARMAP.get(sessionKey));
 
-    // Trace
-    console.log(
-      JSON.stringify({
-        tag: "UA_TRACE",
-        keep: k.id,
-        name: k.name,
-        curr,
-        prev,
-        hasSession,
-        prevRaw,
-      })
-    );
-
+    // Rising edge
     if (curr && !prev) {
-      // Rising edge
       if (!hasSession && !(await env.WARMAP.get(dedupeKey))) {
         const embed = {
           title: `⚔️ ${k.name} is under attack!`,
@@ -750,7 +729,7 @@ async function alertOnUnderAttackTransitions(
           embed,
           kind: "header",
           onOk: async () => {
-            // Mark “one-per-siege” and per-event dedupe
+            // begin siege session & per-payload dedupe
             await safePutIfChanged(env, sessionKey, "1", {
               expirationTtl: ttlSec,
             });
@@ -758,25 +737,23 @@ async function alertOnUnderAttackTransitions(
               expirationTtl: 6 * 60 * 60,
             });
 
-            // Mark UA state “on” and keep it alive for a long time
+            // mark UA “on”
             await safePutIfChanged(env, prevKey, String(Date.now()), {
               expirationTtl: ttlSec,
             });
-
             sentHeader++;
           },
         });
       } else {
-        // Already in-session or deduped for this payload — don’t send
-        skippedHeader++;
-        // Still ensure UA state stays "on"
+        // no send, but ensure UA state is “on”
         await safePutIfChanged(env, prevKey, String(Date.now()), {
           expirationTtl: ttlSec,
         });
+        skippedHeader++;
       }
-    } else if (curr && prev) {
-      // Still flaming — DO NOT send again.
-      // Just keep the UA “on” state (and optionally the session flag) fresh so TTLs don’t expire mid-siege.
+    }
+    // Still flaming — don’t resend, just keep TTL fresh
+    else if (curr && prev) {
       await safePutIfChanged(env, prevKey, String(Date.now()), {
         expirationTtl: ttlSec,
       });
@@ -784,18 +761,18 @@ async function alertOnUnderAttackTransitions(
         await safePutIfChanged(env, sessionKey, "1", { expirationTtl: ttlSec });
       }
       skippedHeader++;
-    } else if (!curr && prev) {
-      // Falling edge — end the session and clear UA state
+    }
+    // Flame went out — clear state and end session
+    else if (!curr && prev) {
       await safePutIfChanged(env, prevKey, "0");
       await safeDelete(env, sessionKey);
-      // Also clear the header throttle (if you ever set it elsewhere)
+      // optional: also clear any old header throttle if you ever used it
       await safeDelete(env, `alert:ua:header:${k.id}`);
       resetHeader++;
     }
   }
 
-  // -------- Event-based fallback (when header banner isn't visible)
-  // (This stays the same except for the throttle: we keep the once-per-window behavior here)
+  // ---------- FALLBACK PATH (events table when no banner) ----------
   const byId = new Map(payload.keeps.map((k) => [k.id, k]));
   let considered = 0,
     deduped = 0,
@@ -804,14 +781,13 @@ async function alertOnUnderAttackTransitions(
 
   for (const ev of payload.events) {
     if (ev.kind !== "underAttack") continue;
-
     const k = byId.get(ev.keepId);
     if (!k) {
       missing++;
       continue;
     }
 
-    // If header already shows a flame, header path governs sessioning
+    // If header is flaming, header path governs sessioning
     if (k.headerUnderAttack) continue;
 
     considered++;
@@ -850,17 +826,32 @@ async function alertOnUnderAttackTransitions(
         await safePutIfChanged(env, dedupeKey, "1", {
           expirationTtl: 6 * 60 * 60,
         });
+
+        // IMPORTANT: mark a siege session so header & fallback behave as one
+        await safePutIfChanged(env, `alert:ua:start:${ev.keepId}`, "1", {
+          expirationTtl: ttlSec,
+        });
+
+        // Also mark UA “on” so subsequent ticks treat it as flaming even if the next event is late
+        await safePutIfChanged(
+          env,
+          `ua:state:${ev.keepId}`,
+          String(Date.now()),
+          {
+            expirationTtl: ttlSec,
+          }
+        );
+
         sent++;
       },
     });
   }
 
-  // -------- Send in chunks of 10 embeds ----------
+  // ---------- send ----------
   if (batch.length > 0 && env.DISCORD_WEBHOOK_URL) {
     for (let i = 0; i < batch.length; i += 10) {
       const slice = batch.slice(i, i + 10);
       const embeds = slice.map((b) => b.embed);
-
       const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_URL, {
         username: "Uthgard Herald",
         embeds,
@@ -1177,8 +1168,9 @@ router.post("/admin/reset-ua", async (req, env: Environment) => {
   if (!keepId) return new Response("missing ?keep=<slug>", { status: 400 });
 
   await safePutIfChanged(env, `ua:state:${keepId}`, "0");
+  await safeDelete(env, `alert:ua:start:${keepId}`); // NEW
   await safeDelete(env, `alert:ua:nobanner:${keepId}`);
-  await safeDelete(env, `alert:ua:header:${keepId}`); // <-- add this
+  await safeDelete(env, `alert:ua:header:${keepId}`);
   return new Response(`reset ${keepId}`);
 });
 
@@ -1412,16 +1404,12 @@ async function alertOnRecentCapturesFromEvents(
     const atMs = Date.parse(ev.at);
     if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
 
-    // ---------------- FIX A: strong once-per keep+newOwner TTL gate ----------------
     const onceKey = capOnceKey(ev.keepId, ev.newOwner!);
     if (await env.WARMAP.get(onceKey)) continue;
-    // -----------------------------------------------------------------------------
 
-    // unified per-minute dedupe (keeps dupes within same minute down)
     const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at);
     if (await env.WARMAP.get(kAny)) continue;
 
-    // legacy "already seen" guard (kept as extra belt)
     if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!)) continue;
 
     const ok = await notifyDiscordCapture(env, {
@@ -1438,6 +1426,8 @@ async function alertOnRecentCapturesFromEvents(
         safePutIfChanged(env, onceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
+        safeDelete(env, `alert:ua:start:${ev.keepId}`), // NEW: end UA session on capture
+        safePutIfChanged(env, `ua:state:${ev.keepId}`, "0"), // NEW: clear UA "on" state
       ]);
     }
   }
