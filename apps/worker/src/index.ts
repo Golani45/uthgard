@@ -1423,6 +1423,7 @@ async function safeDelete(env: Environment, key: string) {
 
 // --- alert from recent "captured" rows, with Fix A once-per keep+owner gate
 // --- alert from recent "captured" rows, with Fix A once-per keep+owner gate
+// --- alert from recent "captured" rows, with unified dedupe keys
 async function alertOnRecentCapturesFromEvents(
   env: Environment,
   payload: WarmapData
@@ -1436,14 +1437,26 @@ async function alertOnRecentCapturesFromEvents(
     const atMs = Date.parse(ev.at);
     if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
 
-    const onceKey = capOnceKey(ev.keepId, ev.newOwner!);
+    // 1) Belt-and-suspenders: if ownership path already updated
+    //    the baseline to this owner, let that path "own" the alert.
+    //    This uses the same key the ownership path writes.
+    const ownKey = `own:${ev.keepId}`;
+    const baselineOwner = (await env.WARMAP.get(ownKey)) as Realm | null;
+    if (baselineOwner === ev.newOwner) {
+      // Ownership-change path has already handled this capture.
+      continue;
+    }
+
+    // 2) Keep existing unified dedupe checks (same as ownership path)
+    const onceKey = capOnceKey(ev.keepId, ev.newOwner!); // once-per new owner
     if (await env.WARMAP.get(onceKey)) continue;
 
-    const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at);
+    const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at); // minute bucket
     if (await env.WARMAP.get(kAny)) continue;
 
     if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!)) continue;
 
+    // 3) Send
     const ok = await notifyDiscordCapture(env, {
       keepName: ev.keepName,
       newOwner: ev.newOwner!,
@@ -1451,6 +1464,7 @@ async function alertOnRecentCapturesFromEvents(
       leader: (ev as any).leader,
     });
 
+    // 4) Mark dedupe + suppress UA regardless of path ordering
     if (ok) {
       await Promise.all([
         markCaptureAlerted(env, ev.keepId, ev.newOwner!),
