@@ -78,6 +78,8 @@ function createJsonResponse(data: any, status = 200): Response {
   });
 }
 
+const UA_SUPPRESS_AFTER_CAPTURE_SEC = 120;
+
 const ownerMap: Record<string, Realm> = {
   alb: "Albion",
   albion: "Albion",
@@ -575,10 +577,17 @@ async function alertOnOwnershipChanges(
         safePutIfChanged(env, transitionOnceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
-        safeDelete(env, `alert:ua:start:${k.id}`), // NEW: end UA session on capture
-        safePutIfChanged(env, `ua:state:${k.id}`, "0"), // NEW: clear UA "on" state
       ]);
     }
+
+    // Always end UA + suppress briefly, regardless of webhook result
+    await Promise.all([
+      safeDelete(env, `alert:ua:start:${k.id}`),
+      safePutIfChanged(env, `ua:state:${k.id}`, "0"),
+      safePutIfChanged(env, `ua:suppress:${k.id}`, "1", {
+        expirationTtl: UA_SUPPRESS_AFTER_CAPTURE_SEC,
+      }),
+    ]);
   }
 }
 
@@ -709,6 +718,17 @@ async function alertOnUnderAttackTransitions(
     const curr = !!k.headerUnderAttack;
     const hasSession = !!(await env.WARMAP.get(sessionKey));
 
+    // --- NEW: short post-capture UA suppressor ---
+    const suppressKey = `ua:suppress:${k.id}`;
+    const isSuppressed = !!(await env.WARMAP.get(suppressKey));
+    if (isSuppressed) {
+      // Make sure we don't resurrect sessions during suppression
+      await safePutIfChanged(env, prevKey, "0");
+      await safeDelete(env, sessionKey);
+      // Skip any UA send for this keep this tick
+      continue;
+    }
+
     // Rising edge
     if (curr && !prev) {
       if (!hasSession && !(await env.WARMAP.get(dedupeKey))) {
@@ -790,6 +810,11 @@ async function alertOnUnderAttackTransitions(
     // If header is flaming, header path governs sessioning
     if (k.headerUnderAttack) continue;
 
+    // --- NEW: suppressor also applies to fallback path ---
+    if (await env.WARMAP.get(`ua:suppress:${k.id}`)) {
+      continue;
+    }
+
     considered++;
 
     const nobannerKey = `alert:ua:nobanner:${ev.keepId}`;
@@ -827,7 +852,7 @@ async function alertOnUnderAttackTransitions(
           expirationTtl: 6 * 60 * 60,
         });
 
-        // IMPORTANT: mark a siege session so header & fallback behave as one
+        // Mark a siege session so header & fallback behave as one
         await safePutIfChanged(env, `alert:ua:start:${ev.keepId}`, "1", {
           expirationTtl: ttlSec,
         });
@@ -837,9 +862,7 @@ async function alertOnUnderAttackTransitions(
           env,
           `ua:state:${ev.keepId}`,
           String(Date.now()),
-          {
-            expirationTtl: ttlSec,
-          }
+          { expirationTtl: ttlSec }
         );
 
         sent++;
@@ -1426,10 +1449,17 @@ async function alertOnRecentCapturesFromEvents(
         safePutIfChanged(env, onceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
-        safeDelete(env, `alert:ua:start:${ev.keepId}`), // NEW: end UA session on capture
-        safePutIfChanged(env, `ua:state:${ev.keepId}`, "0"), // NEW: clear UA "on" state
       ]);
     }
+
+    // Always end UA + suppress briefly
+    await Promise.all([
+      safeDelete(env, `alert:ua:start:${ev.keepId}`),
+      safePutIfChanged(env, `ua:state:${ev.keepId}`, "0"),
+      safePutIfChanged(env, `ua:suppress:${ev.keepId}`, "1", {
+        expirationTtl: UA_SUPPRESS_AFTER_CAPTURE_SEC,
+      }),
+    ]);
   }
 }
 
