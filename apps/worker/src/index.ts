@@ -570,16 +570,25 @@ async function alertOnOwnershipChanges(
     });
 
     if (ok) {
+      const kAny = capDedupKey(k.id, k.owner, ev.at); // same minute bucket key the events path uses
+      const onceKey = capOnceKey(k.id, k.owner); // same once-per newOwner key the events path checks
+
       await Promise.all([
+        // existing
         safePut(env, ownKey, k.owner),
         markCaptureAlerted(env, k.id, k.owner),
         safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
         safePutIfChanged(env, transitionOnceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
+
+        // NEW — align with events-path dedupe
+        safePutIfChanged(env, onceKey, "1", {
+          expirationTtl: CAP_ONCE_TTL_SEC,
+        }),
+        safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
       ]);
     }
-
     // Always end UA + suppress briefly, regardless of webhook result
     await Promise.all([
       safeDelete(env, `alert:ua:start:${k.id}`),
