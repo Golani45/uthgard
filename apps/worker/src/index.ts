@@ -514,11 +514,13 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 // NEW: alert once per ownership change (rising edge) with recency guard + leader passthrough
 // --- alert when ownership flips (rising edge), with Fix A once-per keep+owner gate
 // --- alert when ownership flips (rising edge), with transition-scoped once gate
+// --- alert when ownership flips (rising edge), with unified dedupe + baseline advance
 async function alertOnOwnershipChanges(
   env: Environment,
   payload: WarmapData,
   prev: WarmapData | null
 ) {
+  // index the most recent "captured" event by keep
   const recentCapturedByKeep = new Map<string, Event>();
   for (const e of payload.events) {
     if (e.kind !== "captured") continue;
@@ -528,6 +530,7 @@ async function alertOnOwnershipChanges(
     }
   }
 
+  // fall back to previous snapshot's owners if we don't have a KV baseline yet
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
 
   for (const k of payload.keeps) {
@@ -535,36 +538,62 @@ async function alertOnOwnershipChanges(
     const prevKV = await env.WARMAP.get(ownKey);
     const baseline = (prevKV ?? prevOwnerById.get(k.id)) as Realm | null;
 
+    // first sighting — seed baseline and move on
     if (baseline == null) {
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    if (baseline === k.owner) {
-      continue;
-    }
+    // no change
+    if (baseline === k.owner) continue;
 
+    // require a fresh captured event within the capture window
     const CAP_WINDOW_MS = captureWindowMs(env);
     const ev = recentCapturedByKeep.get(k.id);
     const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
-
     if (!evFresh) {
+      // We saw owner flipped but don't have a fresh event—advance baseline quietly.
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
+    // transition-scoped once key (baseline -> current owner)
     const transitionOnceKey = capOnceTransitionKey(k.id, baseline, k.owner);
     if (await env.WARMAP.get(transitionOnceKey)) {
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    const transition = `${baseline}->${k.owner}`;
-    const dedupeKey = `cap:${k.id}:${transition}`;
-    if (await env.WARMAP.get(dedupeKey)) {
+    // ---- PRE-FLIGHT: honor events-path dedupe too ----
+    // (so if events path already alerted, ownership path won't double-send)
+    const onceKey = capOnceKey(k.id, k.owner); // once-per new owner
+    if (await env.WARMAP.get(onceKey)) {
+      await safePut(env, ownKey, k.owner);
       continue;
     }
 
+    const kAny = capDedupKey(k.id, k.owner, ev.at); // minute bucket
+    if (await env.WARMAP.get(kAny)) {
+      await safePut(env, ownKey, k.owner);
+      continue;
+    }
+
+    if (await hasAlertedCapture(env, k.id, k.owner)) {
+      // cap:seen:<id>:<owner>
+      await safePut(env, ownKey, k.owner);
+      continue;
+    }
+    // --------------------------------------------------
+
+    // local transition dedupe (short TTL)
+    const transition = `${baseline}->${k.owner}`;
+    const dedupeKey = `cap:${k.id}:${transition}`;
+    if (await env.WARMAP.get(dedupeKey)) {
+      await safePut(env, ownKey, k.owner);
+      continue;
+    }
+
+    // send capture
     const ok = await notifyDiscordCapture(env, {
       keepName: k.name,
       newOwner: k.owner,
@@ -572,28 +601,25 @@ async function alertOnOwnershipChanges(
       leader: (ev as any).leader,
     });
 
+    // If sent, stamp all dedupe keys that the events path also respects
     if (ok) {
-      const kAny = capDedupKey(k.id, k.owner, ev.at); // same minute bucket key the events path uses
-      const onceKey = capOnceKey(k.id, k.owner); // same once-per newOwner key the events path checks
-
       await Promise.all([
-        // existing
-        safePut(env, ownKey, k.owner),
-        markCaptureAlerted(env, k.id, k.owner),
-        safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
-        safePutIfChanged(env, transitionOnceKey, "1", {
-          expirationTtl: CAP_ONCE_TTL_SEC,
-        }),
-
-        // NEW — align with events-path dedupe
+        markCaptureAlerted(env, k.id, k.owner), // cap:seen
+        safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
         safePutIfChanged(env, onceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
-        safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
+        safePutIfChanged(env, transitionOnceKey, "1", {
+          expirationTtl: CAP_ONCE_TTL_SEC,
+        }),
+        safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
       ]);
     }
-    // Always end UA + suppress briefly, regardless of webhook result
+
+    // ALWAYS advance baseline & clear UA, even if Discord failed,
+    // so we don't keep retrying next tick.
     await Promise.all([
+      safePut(env, ownKey, k.owner),
       safeDelete(env, `alert:ua:start:${k.id}`),
       safePutIfChanged(env, `ua:state:${k.id}`, "0"),
       safePutIfChanged(env, `ua:suppress:${k.id}`, "1", {
