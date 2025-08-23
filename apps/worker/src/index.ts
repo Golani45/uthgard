@@ -12,6 +12,9 @@ interface Environment {
   TRACKED_PLAYERS?: string; // ⬅️ stringified JSON
   ACTIVITY_SESSION_MIN?: string; // ⬅️ minutes to treat as one "session" (default 30)
   CAPTURE_WINDOW_MIN?: string; // how recent a "captured" can be to alert (default 12)
+
+  ACTIVITY_BIG_DELTA?: string; // default 500 if unset
+  ACTIVITY_REPING_MIN?: string; // default 10 if unset
 }
 
 type Event = {
@@ -955,10 +958,14 @@ async function checkTrackedPlayers(env: Environment, onlyId?: string) {
     return;
   }
 
-  const sessionMin = Number(env.ACTIVITY_SESSION_MIN ?? "30"); // minutes
+  const sessionMin = Number(env.ACTIVITY_SESSION_MIN ?? "30"); // main cooldown
+  const bigDelta = Number(env.ACTIVITY_BIG_DELTA ?? "500"); // bypass threshold
+  const repingMin = Number(env.ACTIVITY_REPING_MIN ?? "10"); // heartbeat window
+  const REPING_MS = Math.max(1, repingMin) * 60_000;
 
   for (const p of players) {
     if (onlyId && p.id !== onlyId) continue;
+
     try {
       const res = await fetch(p.url, {
         headers: {
@@ -973,14 +980,15 @@ async function checkTrackedPlayers(env: Environment, onlyId?: string) {
       }
 
       const html = await res.text();
-      const rp = parseRP(html); // LIFETIME RP (keep this)
+      const rp = parseRP(html); // lifetime RP
       if (rp == null) {
         console.log("no RP found", p.id);
         continue;
       }
 
       const rpKey = `rp:${p.id}`; // baseline total RP
-      const activeKey = `rp:active:${p.id}`; // "in session" flag
+      const activeKey = `rp:active:${p.id}`; // “in session” flag
+      const lastKey = `rp:last:${p.id}`; // last time we actually pinged
 
       const prevRaw = await env.WARMAP.get(rpKey);
 
@@ -993,35 +1001,39 @@ async function checkTrackedPlayers(env: Environment, onlyId?: string) {
         if (!Number.isFinite(prev)) {
           // corrupted baseline, reset it
           await safePutIfChanged(env, rpKey, String(rp));
+          await safeDelete(env, activeKey);
+          await safeDelete(env, lastKey);
         } else if (rp < prev) {
-          // rollover / reset: drop session and reset baseline
+          // rollover/reset: drop session and reset baseline
           await safePutIfChanged(env, rpKey, String(rp));
           await safeDelete(env, activeKey);
+          await safeDelete(env, lastKey);
         } else if (rp > prev) {
           // gained RPs since last tick
+          const delta = rp - prev;
           const isActive = !!(await env.WARMAP.get(activeKey));
-          console.log(
-            `RP gain for ${p.id}: +${rp - prev}${
-              isActive ? " (session active)" : ""
-            }`
-          );
+          const lastRaw = await env.WARMAP.get(lastKey);
+          const lastTs = lastRaw ? Number(lastRaw) : 0;
+          const canReping = !lastTs || Date.now() - lastTs > REPING_MS;
 
-          if (!isActive) {
-            const ok = await notifyDiscordPlayer(env, p, rp - prev);
+          // notify if:
+          //   - no active session yet, OR
+          //   - the gain is big enough, OR
+          //   - we're past the heartbeat window (reping) while gains continue
+          if (!isActive || delta >= bigDelta || canReping) {
+            const ok = await notifyDiscordPlayer(env, p, delta);
             if (ok) {
-              // only start a session if we actually notified
               await safePutIfChanged(env, activeKey, "1", {
-                expirationTtl: sessionMin * 60,
+                expirationTtl: sessionMin * 60, // seconds
               });
+              await safePutIfChanged(env, lastKey, String(Date.now()));
             }
-          } else {
-            // DO NOT refresh the TTL here.
-            // Let the active session expire so we can alert again after ~20 min.
           }
-          // update baseline to the new total
+
+          // Always advance the baseline to the new lifetime total
           await safePutIfChanged(env, rpKey, String(rp));
         } else {
-          // equal RPs — do nothing so the session can naturally expire
+          // equal RPs — do nothing; let the active session expire naturally
         }
       }
     } catch (e: any) {
