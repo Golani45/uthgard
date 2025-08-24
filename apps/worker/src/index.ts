@@ -535,13 +535,14 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 // --- alert when ownership flips (rising edge), with transition-scoped once gate
 // --- alert when ownership flips (rising edge), with unified dedupe + baseline advance
 // --- alert when ownership flips (rising edge), STRICT_DELIVERY gating
+// --- alert when ownership flips (rising edge), with unified dedupe + baseline advance
+// --- STRICT_DELIVERY gating: when on, only mutate state/baseline if Discord send succeeds
 async function alertOnOwnershipChanges(
   env: Environment,
   payload: WarmapData,
   prev: WarmapData | null
 ) {
-const STRICT_DELIVERY = await getStrictDelivery(env);
-
+  const STRICT_DELIVERY = await getStrictDelivery(env);
 
   // index the most recent "captured" event by keep
   const recentCapturedByKeep = new Map<string, Event>();
@@ -553,17 +554,13 @@ const STRICT_DELIVERY = await getStrictDelivery(env);
     }
   }
 
-
-  // fall back to previous snapshot's owners if we don't have a KV baseline yet
+  // previous owners from prior snapshot (fallback baseline seed)
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
 
-  // helper to apply baseline + post-capture UA state changes
-  async function applyPostCaptureStateAndBaseline(
-    keepId: string,
-    newOwner: Realm
-  ) {
+  // helper to advance baseline and apply post-capture UA/session changes
+  async function applyPostCaptureStateAndBaseline(keepId: string, newOwner: Realm) {
     await Promise.all([
-      safePut(env, `own:${keepId}`, newOwner), // advance baseline
+      safePut(env, `own:${keepId}`, newOwner),
       safeDelete(env, `alert:ua:start:${keepId}`),
       safePutIfChanged(env, `ua:state:${keepId}`, "0"),
       safePutIfChanged(env, `ua:suppress:${keepId}`, "1", {
@@ -577,59 +574,40 @@ const STRICT_DELIVERY = await getStrictDelivery(env);
     const prevKV = await env.WARMAP.get(ownKey);
     const baseline = (prevKV ?? prevOwnerById.get(k.id)) as Realm | null;
 
-    // first sighting — seed baseline and move on
+    // first sighting — seed baseline
     if (baseline == null) {
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    // no change
+    // unchanged
     if (baseline === k.owner) continue;
 
-    // require a fresh captured event within the capture window
+    // must have a fresh "captured" row to trust the flip
     const CAP_WINDOW_MS = captureWindowMs(env);
     const ev = recentCapturedByKeep.get(k.id);
     const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
     if (!evFresh) {
-      // We saw owner flipped but don't have a fresh event—advance baseline quietly.
+      // owner flipped but we don't have a fresh capture row — advance baseline quietly
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    // transition-scoped once key (baseline -> current owner)
+    // transition-scoped once
     const transitionOnceKey = capOnceTransitionKey(k.id, baseline, k.owner);
     if (await env.WARMAP.get(transitionOnceKey)) {
       await safePut(env, ownKey, k.owner);
       continue;
     }
 
-    // PRE-FLIGHT: honor events-path dedupe too (shared keys)
-    const onceKey = capOnceKey(k.id, k.owner); // once-per new owner
-    if (await env.WARMAP.get(onceKey)) {
-      await safePut(env, ownKey, k.owner);
-      continue;
-    }
+    // unified dedupe with events-path
+    const onceKey = capOnceKey(k.id, k.owner);
+    const kAny = capDedupKey(k.id, k.owner, ev.at);
+    if (await env.WARMAP.get(onceKey)) { await safePut(env, ownKey, k.owner); continue; }
+    if (await env.WARMAP.get(kAny))   { await safePut(env, ownKey, k.owner); continue; }
+    if (await hasAlertedCapture(env, k.id, k.owner)) { await safePut(env, ownKey, k.owner); continue; }
 
-    const kAny = capDedupKey(k.id, k.owner, ev.at); // minute bucket
-    if (await env.WARMAP.get(kAny)) {
-      await safePut(env, ownKey, k.owner);
-      continue;
-    }
-
-    if (await hasAlertedCapture(env, k.id, k.owner)) {
-      await safePut(env, ownKey, k.owner);
-      continue;
-    }
-
-    // local transition dedupe (short TTL)
-    const transition = `${baseline}->${k.owner}`;
-    const dedupeKey = `cap:${k.id}:${transition}`;
-    if (await env.WARMAP.get(dedupeKey)) {
-      await safePut(env, ownKey, k.owner);
-      continue;
-    }
-
-    // send capture
+    // try to send
     const ok = await notifyDiscordCapture(env, {
       keepName: k.name,
       newOwner: k.owner,
@@ -637,27 +615,28 @@ const STRICT_DELIVERY = await getStrictDelivery(env);
       leader: (ev as any).leader,
     });
 
-    // If sent, stamp shared dedupe keys (only on success)
     if (ok) {
+      // success: stamp dedupe + baseline + post-capture UA state
       await Promise.all([
-        markCaptureAlerted(env, k.id, k.owner), // cap:seen
+        markCaptureAlerted(env, k.id, k.owner),
         safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
         safePutIfChanged(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
-        safePutIfChanged(env, transitionOnceKey, "1", {
-          expirationTtl: CAP_ONCE_TTL_SEC,
-        }),
-        safePut(env, dedupeKey, "1", { expirationTtl: 900 }),
+        safePutIfChanged(env, transitionOnceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
       ]);
-    }
-
-    // Baseline + UA state moves:
-    // - STRICT_DELIVERY=1 -> only if ok (so we retry next tick if send failed/cooldown)
-    // - default (0)       -> always (previous behavior)
-    if (ok || !STRICT_DELIVERY) {
       await applyPostCaptureStateAndBaseline(k.id, k.owner);
+    } else {
+      // failure:
+      //   STRICT_DELIVERY=1 -> leave everything untouched so a later tick can retry
+      //   STRICT_DELIVERY=0 -> advance baseline & suppress UA anyway (freshness-first)
+      if (!STRICT_DELIVERY) {
+        await applyPostCaptureStateAndBaseline(k.id, k.owner);
+      } else {
+        console.log("capture send failed; strict=on → keeping baseline unsynced for retry", k.id);
+      }
     }
   }
 }
+
 
 
 function capOnceTransitionKey(
@@ -1729,16 +1708,17 @@ async function safeDelete(env: Environment, key: string) {
 
 // --- alert from recent "captured" rows, unified dedupe, no baseline short-circuit
 // --- alert from recent "captured" rows, unified dedupe, STRICT_DELIVERY gating
+// --- alert from recent "captured" rows, unified dedupe
+// --- STRICT_DELIVERY gating: when on, only mutate UA/session state if send succeeds
 async function alertOnRecentCapturesFromEvents(
   env: Environment,
   payload: WarmapData
 ) {
+  const STRICT_DELIVERY = await getStrictDelivery(env);
   const now = Date.now();
   const WINDOW_MS = captureWindowMs(env);
-  const STRICT_DELIVERY = await getStrictDelivery(env);
 
-
-  // helper: post-capture UA/session state changes
+  // helper: UA/session state moves after capture
   async function applyPostCaptureState(keepId: string) {
     await Promise.all([
       safeDelete(env, `alert:ua:start:${keepId}`),
@@ -1755,16 +1735,16 @@ async function alertOnRecentCapturesFromEvents(
     const atMs = Date.parse(ev.at);
     if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
 
-    // Unified dedupe gates (shared with ownership path)
+    // unified dedupe gates (shared with ownership path)
     const onceKey = capOnceKey(ev.keepId, ev.newOwner!); // 20 min
     if (await env.WARMAP.get(onceKey)) continue;
 
     const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at); // 6 h
     if (await env.WARMAP.get(kAny)) continue;
 
-    if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!)) continue; // 20 min
+    if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!)) continue;
 
-    // Send
+    // send
     const ok = await notifyDiscordCapture(env, {
       keepName: ev.keepName,
       newOwner: ev.newOwner!,
@@ -1772,23 +1752,28 @@ async function alertOnRecentCapturesFromEvents(
       leader: (ev as any).leader,
     });
 
-    // Stamp dedupe keys ONLY on success
     if (ok) {
+      // success: stamp dedupe + post-capture UA/session state
       await Promise.all([
         markCaptureAlerted(env, ev.keepId, ev.newOwner!),
         safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
         safePutIfChanged(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
       ]);
-    }
-
-    // UA/session state moves:
-    // - STRICT_DELIVERY=1 -> only if ok (so we can retry later)
-    // - default (0)       -> always (previous behavior)
-    if (ok || !STRICT_DELIVERY) {
       await applyPostCaptureState(ev.keepId);
+    } else {
+      // failure:
+      //   STRICT_DELIVERY=1 -> leave state as-is so a later tick can retry
+      //   STRICT_DELIVERY=0 -> still apply post-capture UA/session moves (old behavior)
+      if (!STRICT_DELIVERY) {
+        await applyPostCaptureState(ev.keepId);
+      } else {
+        console.log("events-path capture send failed; strict=on → leaving state for retry", ev.keepId);
+      }
     }
   }
 }
+
+
 
 
 
