@@ -93,6 +93,61 @@ const ownerMap: Record<string, Realm> = {
   hibernia: "Hibernia",
 };
 
+type CaptureBatchItem = {
+  embed: any;
+  onOk: () => Promise<void>;
+};
+
+function capClaimKey(keepId: string, newOwner: Realm, atIso: string) {
+  const bucket = new Date(atIso);
+  bucket.setSeconds(0, 0);
+  return `cap:claim:${keepId}:${newOwner}:${bucket.toISOString()}`;
+}
+
+const GLOBAL_MIN_INTERVAL_MS = 6000; // small global floor across all webhooks
+function globalLastSendKey() { return "discord:global:last"; }
+
+async function enforceGlobalPacing(env: Environment) {
+  const lastRaw = await env.WARMAP.get(globalLastSendKey());
+  const last = lastRaw ? Number(lastRaw) : 0;
+  const now = Date.now();
+  const wait = last ? GLOBAL_MIN_INTERVAL_MS - (now - last) : 0;
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+}
+
+async function noteGlobalSent(env: Environment) {
+  await env.WARMAP.put(globalLastSendKey(), String(Date.now()), { expirationTtl: 3600 });
+}
+
+function penaltyKey(url: string) { return `discord:penalty:${cooldownKeyFor(url)}`; }
+
+async function getPenalty(env: Environment, url: string) {
+  const raw = await env.WARMAP.get(penaltyKey(url));
+  const n = raw ? Number(raw) : 0;
+  return Number.isFinite(n) ? Math.max(0, n) : 0; // 0..∞ (we clamp on bump)
+}
+
+async function bumpPenalty(env: Environment, url: string) {
+  const n = (await getPenalty(env, url)) + 1;
+  await env.WARMAP.put(penaltyKey(url), String(Math.min(n, 4)), { expirationTtl: 30 * 60 }); // cap x3 spacing, 30m decay
+}
+
+async function clearPenalty(env: Environment, url: string) {
+  await env.WARMAP.delete(penaltyKey(url));
+}
+
+async function tryClaimCapture(
+  env: Environment,
+  keepId: string,
+  newOwner: Realm,
+  atIso: string
+) {
+  const key = capClaimKey(keepId, newOwner, atIso);
+  const existed = await env.WARMAP.get(key);
+  if (existed) return false; // another path/tick already claimed
+  await safePutIfChanged(env, key, "1", { expirationTtl: 120 }); // short lived
+  return true;
+}
 function normRealm(r: string): Realm | null {
   const t = r.toLowerCase();
   if (t.startsWith("alb")) return "Albion";
@@ -282,14 +337,17 @@ async function postToDiscord(
     return false;
   }
 
-  // Skip sends while we're in cooldown from a previous 429
+  // respect any active cooldown we set after a 429
   if (await discordCooldownActive(env, url)) {
     console.log("discord: cooldown active for", cooldownKeyFor(url));
-      await noteCooldownSkip(env, url);  
+    await noteCooldownSkip(env, url);
     return false;
   }
 
-  // Gentle pacing across ALL sends to this webhook URL
+  // NEW: global pacing so different webhooks don't braid together
+  await enforceGlobalPacing(env);
+
+  // Per-webhook pacing with penalty-aware spacing
   await enforceWebhookPacing(env, url);
 
   const resp = await fetch(url, {
@@ -304,30 +362,29 @@ async function postToDiscord(
   if (resp.status === 429) {
     const secs = parseRetryAfter(resp);
     await setDiscordCooldown(env, url, secs);
-     await note429(env, url, secs); 
+    await note429(env, url, secs);
+    await bumpPenalty(env, url); // <-- increase spacing next attempts
     const txt = await resp.text().catch(() => "");
-    console.log(
-      "discord 429, backing off secs:",
-      secs,
-      "code:",
-      txt.slice(0, 64)
-    );
+    console.log("discord 429, backing off secs:", secs, "code:", txt.slice(0, 64));
     return false;
   }
 
   if (!resp.ok) {
-    console.log(
-      "discord error",
-      resp.status,
-      await resp.text().catch(() => "...")
-    );
+    console.log("discord error", resp.status, await resp.text().catch(() => "..."));
     return false;
   }
 
-  // Only record a successful send as the last-send time
   await noteWebhookSent(env, url);
+  await noteGlobalSent(env);   // <-- record global last send
+  await clearPenalty(env, url); // <-- reset penalty on success
   return true;
 }
+
+function penaltyPrefixFor(url?: string | null): string | null {
+  if (!url) return null;
+  return `discord:penalty:${cooldownKeyFor(url)}`;
+}
+function globalLastKey() { return "discord:global:last"; }
 
 // --- helpers for sims ---
 function mkKeepPartial(id: string, name: string, owner: Realm): Keep {
@@ -532,10 +589,6 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 
 // NEW: alert once per ownership change (rising edge) with recency guard + leader passthrough
 // --- alert when ownership flips (rising edge), with Fix A once-per keep+owner gate
-// --- alert when ownership flips (rising edge), with transition-scoped once gate
-// --- alert when ownership flips (rising edge), with unified dedupe + baseline advance
-// --- alert when ownership flips (rising edge), STRICT_DELIVERY gating
-// --- alert when ownership flips (rising edge), with unified dedupe + baseline advance
 // --- STRICT_DELIVERY gating: when on, only mutate state/baseline if Discord send succeeds
 async function alertOnOwnershipChanges(
   env: Environment,
@@ -557,7 +610,6 @@ async function alertOnOwnershipChanges(
   // previous owners from prior snapshot (fallback baseline seed)
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
 
-  // helper to advance baseline and apply post-capture UA/session changes
   async function applyPostCaptureStateAndBaseline(keepId: string, newOwner: Realm) {
     await Promise.all([
       safePut(env, `own:${keepId}`, newOwner),
@@ -568,6 +620,8 @@ async function alertOnOwnershipChanges(
       }),
     ]);
   }
+
+  const capBatch: CaptureBatchItem[] = [];
 
   for (const k of payload.keeps) {
     const ownKey = `own:${k.id}`;
@@ -588,7 +642,6 @@ async function alertOnOwnershipChanges(
     const ev = recentCapturedByKeep.get(k.id);
     const evFresh = !!ev && Date.now() - Date.parse(ev.at) <= CAP_WINDOW_MS;
     if (!evFresh) {
-      // owner flipped but we don't have a fresh capture row — advance baseline quietly
       await safePut(env, ownKey, k.owner);
       continue;
     }
@@ -604,38 +657,59 @@ async function alertOnOwnershipChanges(
     const onceKey = capOnceKey(k.id, k.owner);
     const kAny = capDedupKey(k.id, k.owner, ev.at);
     if (await env.WARMAP.get(onceKey)) { await safePut(env, ownKey, k.owner); continue; }
-    if (await env.WARMAP.get(kAny))   { await safePut(env, ownKey, k.owner); continue; }
+    if (await env.WARMAP.get(kAny))   { await safePut(env, ownKey, k.owner); continue; } // <-- fixed (was ownOwner)
     if (await hasAlertedCapture(env, k.id, k.owner)) { await safePut(env, ownKey, k.owner); continue; }
 
-    // try to send
-    const ok = await notifyDiscordCapture(env, {
-      keepName: k.name,
-      newOwner: k.owner,
-      at: ev.at,
-      leader: (ev as any).leader,
-    });
+    // ensure only one path/tick queues this capture
+    if (!(await tryClaimCapture(env, k.id, k.owner, ev.at))) {
+      await safePut(env, ownKey, k.owner); // baseline advances; other path will send
+      continue;
+    }
 
-    if (ok) {
-      // success: stamp dedupe + baseline + post-capture UA state
-      await Promise.all([
-        markCaptureAlerted(env, k.id, k.owner),
-        safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
-        safePutIfChanged(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
-        safePutIfChanged(env, transitionOnceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
-      ]);
-      await applyPostCaptureStateAndBaseline(k.id, k.owner);
-    } else {
-      // failure:
-      //   STRICT_DELIVERY=1 -> leave everything untouched so a later tick can retry
-      //   STRICT_DELIVERY=0 -> advance baseline & suppress UA anyway (freshness-first)
-      if (!STRICT_DELIVERY) {
+    // queue embed (batched send later)
+    const leaderSuffix = (ev as any).leader ? ` — led by ${(ev as any).leader}` : "";
+    const embed = {
+      title: `🏰 ${k.name} was captured by ${k.owner}${leaderSuffix}`,
+      color: REALM_COLOR[k.owner],
+      timestamp: ev.at,
+      footer: EMBED_FOOTER,
+    };
+
+    capBatch.push({
+      embed,
+      onOk: async () => {
+        await Promise.all([
+          markCaptureAlerted(env, k.id, k.owner),
+          safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
+          safePutIfChanged(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
+          safePutIfChanged(env, transitionOnceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
+        ]);
         await applyPostCaptureStateAndBaseline(k.id, k.owner);
+      },
+    });
+  }
+
+  // single POST (chunk embeds by 10 to satisfy Discord)
+  if (capBatch.length > 0 && env.DISCORD_WEBHOOK_CAPTURE) {
+    for (let i = 0; i < capBatch.length; i += 10) {
+      const slice = capBatch.slice(i, i + 10);
+      const embeds = slice.map(b => b.embed);
+      const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_CAPTURE, {
+        username: WEBHOOK_USERNAME,
+        embeds,
+      });
+      if (ok) {
+        await Promise.all(slice.map(b => b.onOk()));
+      } else if (!STRICT_DELIVERY) {
+        await Promise.all(slice.map(b => b.onOk())); // freshness-first
       } else {
-        console.log("capture send failed; strict=on → keeping baseline unsynced for retry", k.id);
+        console.log("capture batch send failed; strict=on → leaving state for retry");
       }
     }
   }
 }
+
+
 
 
 
@@ -939,7 +1013,7 @@ async function alertOnUnderAttackTransitions(
   );
 }
 
-const WEBHOOK_MIN_INTERVAL_MS = 3600;
+const WEBHOOK_MIN_INTERVAL_MS = 8000;
 
 // add small jitter to reduce “same-millisecond” races across isolates
 const PACE_JITTER_MIN_MS = 200;
@@ -952,25 +1026,28 @@ function lastSendKeyFor(url: string) {
 async function enforceWebhookPacing(
   env: Environment,
   url: string,
-  minMs = WEBHOOK_MIN_INTERVAL_MS
+  baseMs = WEBHOOK_MIN_INTERVAL_MS
 ) {
   const k = lastSendKeyFor(url);
   const lastRaw = await env.WARMAP.get(k);
   const last = lastRaw ? Number(lastRaw) : 0;
 
+  const penalty = await getPenalty(env, url);  // 0..4
+  const minMs = baseMs * (1 + 0.5 * penalty);  // 1.0x,1.5x,2.0x,2.5x,3.0x
+
   const now = Date.now();
   const baseWait = last ? minMs - (now - last) : 0;
 
-  // random jitter per send to avoid two senders aligning perfectly
+  // use your existing jitter constants if already defined
   const jitter =
     Math.floor(Math.random() * (PACE_JITTER_MAX_MS - PACE_JITTER_MIN_MS + 1)) +
     PACE_JITTER_MIN_MS;
 
   const wait = Math.max(0, baseWait + jitter);
-  if (wait > 0) {
-    await new Promise((r) => setTimeout(r, wait));
-  }
+  if (wait > 0) await new Promise((r) => setTimeout(r, wait));
 }
+
+
 
 async function noteWebhookSent(env: Environment, url: string) {
   await env.WARMAP.put(lastSendKeyFor(url), String(Date.now()), {
@@ -1382,6 +1459,8 @@ router.get("/admin/ops", async (req, env: Environment) => {
     if (!url) return { name, configured: false };
     const cdKey = cooldownKeyFor(url);
     const lastKey = lastSendKeyFor(url);
+    const glast = await env.WARMAP.get(globalLastSendKey());
+    const pen = await getPenalty(env, url);
     const [until, last] = await Promise.all([
       env.WARMAP.get(cdKey),
       env.WARMAP.get(lastKey),
@@ -1391,6 +1470,9 @@ router.get("/admin/ops", async (req, env: Environment) => {
       configured: true,
       cooldown_key: cdKey,
       cooldown_until: stamp(until),
+      penalty_level: pen, // 0..4
+      global_last_send_ms: glast ? Number(glast) : null,
+      global_last_send_iso: glast ? new Date(Number(glast)).toISOString() : null,
       cooldown_secs_remaining: secsLeft(until),
       last_send_key: lastKey,
       last_send_ms: last ? Number(last) : null,
@@ -1399,21 +1481,24 @@ router.get("/admin/ops", async (req, env: Environment) => {
   }
 
   // ----- actions (mutations) -----
-  if (action === "clear-cooldowns") {
-    const targets = [
-      env.DISCORD_WEBHOOK_URL,
-      env.DISCORD_WEBHOOK_CAPTURE,
-      env.DISCORD_WEBHOOK_URL_PLAYERS,
-    ].filter(Boolean) as string[];
+if (action === "clear-cooldowns") {
+  const targets = [
+    env.DISCORD_WEBHOOK_URL,
+    env.DISCORD_WEBHOOK_CAPTURE,
+    env.DISCORD_WEBHOOK_URL_PLAYERS,
+  ].filter(Boolean) as string[];
 
-    for (const u of targets) {
-      await Promise.allSettled([
-        safeDelete(env, cooldownKeyFor(u)),
-        safeDelete(env, lastSendKeyFor(u)),
-      ]);
-    }
-    return createJsonResponse({ ok: true, did: "clear-cooldowns", count: targets.length });
+  for (const u of targets) {
+    await Promise.allSettled([
+      safeDelete(env, cooldownKeyFor(u)),
+      safeDelete(env, lastSendKeyFor(u)),
+      safeDelete(env, penaltyPrefixFor(u)!), // NEW: remove penalty for this webhook
+    ]);
   }
+  // NEW: also clear global last
+  await safeDelete(env, globalLastKey());
+  return createJsonResponse({ ok: true, did: "clear-cooldowns", count: targets.length });
+}
 
   if (action === "reset-ua") {
     if (!keepId) return createJsonResponse({ ok: false, error: "missing ?keep" }, 400);
@@ -1457,19 +1542,23 @@ router.get("/admin/ops", async (req, env: Environment) => {
     return createJsonResponse({ ok: true, strict_delivery: false });
   }
 
-  if (action === "clear-metrics") {
-    let cleared = 0;
-    const prefixes = [
-      r429PrefixFor(env.DISCORD_WEBHOOK_URL),
-      r429PrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
-      r429PrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
-      skipPrefixFor(env.DISCORD_WEBHOOK_URL),
-      skipPrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
-      skipPrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
-    ].filter(Boolean) as string[];
-    for (const p of prefixes) cleared += await clearByPrefix(env, p);
-    return createJsonResponse({ ok: true, did: "clear-metrics", cleared });
-  }
+if (action === "clear-metrics") {
+  let cleared = 0;
+  const prefixes = [
+    r429PrefixFor(env.DISCORD_WEBHOOK_URL),
+    r429PrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
+    r429PrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
+    skipPrefixFor(env.DISCORD_WEBHOOK_URL),
+    skipPrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
+    skipPrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
+    penaltyPrefixFor(env.DISCORD_WEBHOOK_URL),             // NEW
+    penaltyPrefixFor(env.DISCORD_WEBHOOK_CAPTURE),         // NEW
+    penaltyPrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL), // NEW
+  ].filter(Boolean) as string[];
+  for (const p of prefixes) cleared += await clearByPrefix(env, p);
+  await safeDelete(env, globalLastKey()); // NEW
+  return createJsonResponse({ ok: true, did: "clear-metrics", cleared });
+}
 
   // ----- read-only health snapshot -----
   const wm = await env.WARMAP.get<WarmapData>("warmap", "json");
@@ -1719,8 +1808,6 @@ async function safeDelete(env: Environment, key: string) {
 }
 
 // --- alert from recent "captured" rows, unified dedupe, no baseline short-circuit
-// --- alert from recent "captured" rows, unified dedupe, STRICT_DELIVERY gating
-// --- alert from recent "captured" rows, unified dedupe
 // --- STRICT_DELIVERY gating: when on, only mutate UA/session state if send succeeds
 async function alertOnRecentCapturesFromEvents(
   env: Environment,
@@ -1730,7 +1817,6 @@ async function alertOnRecentCapturesFromEvents(
   const now = Date.now();
   const WINDOW_MS = captureWindowMs(env);
 
-  // helper: UA/session state moves after capture
   async function applyPostCaptureState(keepId: string) {
     await Promise.all([
       safeDelete(env, `alert:ua:start:${keepId}`),
@@ -1740,6 +1826,8 @@ async function alertOnRecentCapturesFromEvents(
       }),
     ]);
   }
+
+  const capBatch: CaptureBatchItem[] = [];
 
   for (const ev of payload.events) {
     if (ev.kind !== "captured") continue;
@@ -1756,34 +1844,51 @@ async function alertOnRecentCapturesFromEvents(
 
     if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!)) continue;
 
-    // send
-    const ok = await notifyDiscordCapture(env, {
-      keepName: ev.keepName,
-      newOwner: ev.newOwner!,
-      at: ev.at,
-      leader: (ev as any).leader,
-    });
+    // ensure only one path/tick queues this capture
+    if (!(await tryClaimCapture(env, ev.keepId, ev.newOwner!, ev.at))) {
+      continue;
+    }
 
-    if (ok) {
-      // success: stamp dedupe + post-capture UA/session state
-      await Promise.all([
-        markCaptureAlerted(env, ev.keepId, ev.newOwner!),
-        safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
-        safePutIfChanged(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
-      ]);
-      await applyPostCaptureState(ev.keepId);
-    } else {
-      // failure:
-      //   STRICT_DELIVERY=1 -> leave state as-is so a later tick can retry
-      //   STRICT_DELIVERY=0 -> still apply post-capture UA/session moves (old behavior)
-      if (!STRICT_DELIVERY) {
+    const leaderSuffix = (ev as any).leader ? ` — led by ${(ev as any).leader}` : "";
+    const embed = {
+      title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}${leaderSuffix}`,
+      color: REALM_COLOR[ev.newOwner!],
+      timestamp: ev.at,
+      footer: EMBED_FOOTER,
+    };
+
+    capBatch.push({
+      embed,
+      onOk: async () => {
+        await Promise.all([
+          markCaptureAlerted(env, ev.keepId, ev.newOwner!),
+          safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
+          safePutIfChanged(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
+        ]);
         await applyPostCaptureState(ev.keepId);
+      },
+    });
+  }
+
+  if (capBatch.length > 0 && env.DISCORD_WEBHOOK_CAPTURE) {
+    for (let i = 0; i < capBatch.length; i += 10) {
+      const slice = capBatch.slice(i, i + 10);
+      const embeds = slice.map(b => b.embed);
+      const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_CAPTURE, {
+        username: WEBHOOK_USERNAME,
+        embeds,
+      });
+      if (ok) {
+        await Promise.all(slice.map(b => b.onOk()));
+      } else if (!STRICT_DELIVERY) {
+        await Promise.all(slice.map(b => b.onOk()));
       } else {
-        console.log("events-path capture send failed; strict=on → leaving state for retry", ev.keepId);
+        console.log("events-path capture batch failed; strict=on → leaving state for retry");
       }
     }
   }
 }
+
 
 
 
