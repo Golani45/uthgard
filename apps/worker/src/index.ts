@@ -15,6 +15,7 @@ interface Environment {
 
   ACTIVITY_BIG_DELTA?: string; // default 500 if unset
   ACTIVITY_REPING_MIN?: string; // default 10 if unset
+  STRICT_DELIVERY?: string
 }
 
 type Event = {
@@ -200,7 +201,6 @@ function headerHasUAImage(node: any): boolean {
     'img[src*="/ua."]',
     'img[src$="/ua.png"]',
     // safe generics (keep but no "under")
-    'img[src*="attack"]',
     'img[src*="flame"]',
     'img[src*="onfire"]',
   ].join(", ");
@@ -210,6 +210,13 @@ function headerHasUAImage(node: any): boolean {
 
 // --- Discord rate-limit gate ---
 const RL_KEY = "discord:cooldown_until"; // ISO timestamp
+
+// --- feature flag: strict delivery (env or KV override) ---
+async function getStrictDelivery(env: Environment): Promise<boolean> {
+  const kvOverride = await env.WARMAP.get("flags:strict_delivery"); // "1" or "0"
+  const v = (kvOverride ?? String(env.STRICT_DELIVERY ?? "0")).trim();
+  return v === "1";
+}
 
 async function discordCooldownActive(
   env: Environment,
@@ -255,6 +262,16 @@ function parseRetryAfter(resp: Response): number {
   return Number.isFinite(n) && n > 0 ? n : 10;
 }
 
+async function noteCooldownSkip(env: Environment, url: string) {
+  const k = `${cooldownKeyFor(url)}:skip:${Date.now()}`;
+  await env.WARMAP.put(k, "1", { expirationTtl: 3600 }); // 1h
+}
+
+async function note429(env: Environment, url: string, secs: number) {
+  const k = `discord:429:${cooldownKeyFor(url)}:${Date.now()}`;
+  await env.WARMAP.put(k, String(secs), { expirationTtl: 3600 }); // 1h
+}
+
 async function postToDiscord(
   env: Environment,
   url: string,
@@ -268,6 +285,7 @@ async function postToDiscord(
   // Skip sends while we're in cooldown from a previous 429
   if (await discordCooldownActive(env, url)) {
     console.log("discord: cooldown active for", cooldownKeyFor(url));
+      await noteCooldownSkip(env, url);  
     return false;
   }
 
@@ -286,6 +304,7 @@ async function postToDiscord(
   if (resp.status === 429) {
     const secs = parseRetryAfter(resp);
     await setDiscordCooldown(env, url, secs);
+     await note429(env, url, secs); 
     const txt = await resp.text().catch(() => "");
     console.log(
       "discord 429, backing off secs:",
@@ -515,11 +534,15 @@ function buildWarmapFromHtml(html: string, attackWindowMin = 7): WarmapData {
 // --- alert when ownership flips (rising edge), with Fix A once-per keep+owner gate
 // --- alert when ownership flips (rising edge), with transition-scoped once gate
 // --- alert when ownership flips (rising edge), with unified dedupe + baseline advance
+// --- alert when ownership flips (rising edge), STRICT_DELIVERY gating
 async function alertOnOwnershipChanges(
   env: Environment,
   payload: WarmapData,
   prev: WarmapData | null
 ) {
+const STRICT_DELIVERY = await getStrictDelivery(env);
+
+
   // index the most recent "captured" event by keep
   const recentCapturedByKeep = new Map<string, Event>();
   for (const e of payload.events) {
@@ -530,8 +553,24 @@ async function alertOnOwnershipChanges(
     }
   }
 
+
   // fall back to previous snapshot's owners if we don't have a KV baseline yet
   const prevOwnerById = new Map(prev?.keeps.map((k) => [k.id, k.owner]) ?? []);
+
+  // helper to apply baseline + post-capture UA state changes
+  async function applyPostCaptureStateAndBaseline(
+    keepId: string,
+    newOwner: Realm
+  ) {
+    await Promise.all([
+      safePut(env, `own:${keepId}`, newOwner), // advance baseline
+      safeDelete(env, `alert:ua:start:${keepId}`),
+      safePutIfChanged(env, `ua:state:${keepId}`, "0"),
+      safePutIfChanged(env, `ua:suppress:${keepId}`, "1", {
+        expirationTtl: UA_SUPPRESS_AFTER_CAPTURE_SEC,
+      }),
+    ]);
+  }
 
   for (const k of payload.keeps) {
     const ownKey = `own:${k.id}`;
@@ -564,8 +603,7 @@ async function alertOnOwnershipChanges(
       continue;
     }
 
-    // ---- PRE-FLIGHT: honor events-path dedupe too ----
-    // (so if events path already alerted, ownership path won't double-send)
+    // PRE-FLIGHT: honor events-path dedupe too (shared keys)
     const onceKey = capOnceKey(k.id, k.owner); // once-per new owner
     if (await env.WARMAP.get(onceKey)) {
       await safePut(env, ownKey, k.owner);
@@ -579,11 +617,9 @@ async function alertOnOwnershipChanges(
     }
 
     if (await hasAlertedCapture(env, k.id, k.owner)) {
-      // cap:seen:<id>:<owner>
       await safePut(env, ownKey, k.owner);
       continue;
     }
-    // --------------------------------------------------
 
     // local transition dedupe (short TTL)
     const transition = `${baseline}->${k.owner}`;
@@ -601,14 +637,12 @@ async function alertOnOwnershipChanges(
       leader: (ev as any).leader,
     });
 
-    // If sent, stamp all dedupe keys that the events path also respects
+    // If sent, stamp shared dedupe keys (only on success)
     if (ok) {
       await Promise.all([
         markCaptureAlerted(env, k.id, k.owner), // cap:seen
         safePutIfChanged(env, kAny, "1", { expirationTtl: 6 * 60 * 60 }),
-        safePutIfChanged(env, onceKey, "1", {
-          expirationTtl: CAP_ONCE_TTL_SEC,
-        }),
+        safePutIfChanged(env, onceKey, "1", { expirationTtl: CAP_ONCE_TTL_SEC }),
         safePutIfChanged(env, transitionOnceKey, "1", {
           expirationTtl: CAP_ONCE_TTL_SEC,
         }),
@@ -616,18 +650,15 @@ async function alertOnOwnershipChanges(
       ]);
     }
 
-    // ALWAYS advance baseline & clear UA, even if Discord failed,
-    // so we don't keep retrying next tick.
-    await Promise.all([
-      safePut(env, ownKey, k.owner),
-      safeDelete(env, `alert:ua:start:${k.id}`),
-      safePutIfChanged(env, `ua:state:${k.id}`, "0"),
-      safePutIfChanged(env, `ua:suppress:${k.id}`, "1", {
-        expirationTtl: UA_SUPPRESS_AFTER_CAPTURE_SEC,
-      }),
-    ]);
+    // Baseline + UA state moves:
+    // - STRICT_DELIVERY=1 -> only if ok (so we retry next tick if send failed/cooldown)
+    // - default (0)       -> always (previous behavior)
+    if (ok || !STRICT_DELIVERY) {
+      await applyPostCaptureStateAndBaseline(k.id, k.owner);
+    }
   }
 }
+
 
 function capOnceTransitionKey(
   keepId: string,
@@ -1071,7 +1102,44 @@ async function checkTrackedPlayers(env: Environment, onlyId?: string) {
   }
 }
 
+  // --- metrics helpers (KV count / clear) ---
+async function countByPrefix(env: Environment, prefix: string): Promise<number> {
+  const list = await env.WARMAP.list({ prefix, limit: 1000 });
+  return list.keys.length;
+}
+async function clearByPrefix(env: Environment, prefix: string): Promise<number> {
+  const list = await env.WARMAP.list({ prefix, limit: 1000 });
+  await Promise.allSettled(list.keys.map(k => safeDelete(env, k.name)));
+  return list.keys.length;
+}
+// metric prefixes derived from webhooks
+function skipPrefixFor(url?: string | null): string | null {
+  if (!url) return null;
+  return `${cooldownKeyFor(url)}:skip:`;
+}
+function r429PrefixFor(url?: string | null): string | null {
+  if (!url) return null;
+  return `discord:429:${cooldownKeyFor(url)}:`;
+}
+
 const router = Router();
+
+router.get("/admin/ping-capture", async (_req, env: Environment) => {
+  const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_CAPTURE!, {
+    username: "Uthgard Herald",
+    embeds: [{ title: "🏰 Ping (Capture)", description: "Capture webhook reachable", timestamp: new Date().toISOString() }],
+  });
+  return createJsonResponse({ ok });
+});
+
+router.get("/admin/ping-players", async (_req, env: Environment) => {
+  const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL!, {
+    username: "Uthgard Herald",
+    embeds: [{ title: "🧑‍🤝‍🧑 Ping (Players)", description: "Players webhook reachable", timestamp: new Date().toISOString() }],
+  });
+  return createJsonResponse({ ok });
+});
+
 
 router.get("/api/warmap.json", async (_req, env: Environment) => {
   try {
@@ -1083,6 +1151,14 @@ router.get("/api/warmap.json", async (_req, env: Environment) => {
       502
     );
   }
+});
+
+router.get("/admin/ping", async (_req, env: Environment) => {
+  const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_URL!, {
+    username: "Uthgard Herald",
+    embeds: [{ title: "✅ Ping", description: "Webhook reachable", timestamp: new Date().toISOString() }],
+  });
+  return createJsonResponse({ ok });
 });
 
 router.get("/admin/test-hook", async (_req, env: Environment) => {
@@ -1360,19 +1436,48 @@ router.get("/admin/ops", async (req, env: Environment) => {
     return createJsonResponse({ ok: true, did: "reset-ua", keep: keepId });
   }
 
+  if (action === "reset-all-ua") {
+    const prefixes = ["ua:state:", "alert:ua:start:", "alert:ua:nobanner:", "alert:ua:header:", "ua:suppress:"];
+    let cleared = 0;
+    for (const p of prefixes) cleared += await clearByPrefix(env, p);
+    return createJsonResponse({ ok: true, did: "reset-all-ua", cleared });
+  }
+
   if (action === "clear-cap") {
     if (!keepId || !realm) {
       return createJsonResponse({ ok: false, error: "missing ?keep and/or ?realm" }, 400);
     }
     const keys = [
-      capOnceKey(keepId, realm),          // cap:once:<keep>:<newOwner>
-      capSeenKey(keepId, realm),          // cap:seen:<keep>:<newOwner>
-      // best-effort: last minute bucket is unknown; this just clears the stable gates
+      capOnceKey(keepId, realm),
+      capSeenKey(keepId, realm),
     ];
-    if (prev) keys.push(capOnceTransitionKey(keepId, prev, realm)); // cap:once:<keep>:<prev->new>
+    if (prev) keys.push(capOnceTransitionKey(keepId, prev, realm));
 
     for (const k of keys) await safeDelete(env, k);
     return createJsonResponse({ ok: true, did: "clear-cap", keep: keepId, realm, prev: prev ?? null });
+  }
+
+  if (action === "strict-on") {
+    await env.WARMAP.put("flags:strict_delivery", "1");
+    return createJsonResponse({ ok: true, strict_delivery: true });
+  }
+  if (action === "strict-off") {
+    await env.WARMAP.put("flags:strict_delivery", "0");
+    return createJsonResponse({ ok: true, strict_delivery: false });
+  }
+
+  if (action === "clear-metrics") {
+    let cleared = 0;
+    const prefixes = [
+      r429PrefixFor(env.DISCORD_WEBHOOK_URL),
+      r429PrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
+      r429PrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
+      skipPrefixFor(env.DISCORD_WEBHOOK_URL),
+      skipPrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
+      skipPrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
+    ].filter(Boolean) as string[];
+    for (const p of prefixes) cleared += await clearByPrefix(env, p);
+    return createJsonResponse({ ok: true, did: "clear-metrics", cleared });
   }
 
   // ----- read-only health snapshot -----
@@ -1386,6 +1491,24 @@ router.get("/admin/ops", async (req, env: Environment) => {
         headerUA_names: wm.keeps.filter(k => k.headerUnderAttack).map(k => k.name),
       }
     : { updatedAt: null, ageSec: null, keeps: 0, events: 0 };
+
+  // metrics (last hour) per webhook
+  const strictDeliveryKV = await env.WARMAP.get("flags:strict_delivery");
+  const strictDelivery = (strictDeliveryKV ?? String(env.STRICT_DELIVERY ?? "0")).trim() === "1";
+
+  async function metricBundle(url?: string | null) {
+    const skipP = skipPrefixFor(url);
+    const r429P = r429PrefixFor(url);
+    const cooldownSkips = skipP ? await countByPrefix(env, skipP) : 0;
+    const r429s = r429P ? await countByPrefix(env, r429P) : 0;
+    return { cooldown_skips: cooldownSkips, r429_last_hour: r429s };
+  }
+
+  const metrics = {
+    ua: await metricBundle(env.DISCORD_WEBHOOK_URL),
+    capture: await metricBundle(env.DISCORD_WEBHOOK_CAPTURE),
+    players: await metricBundle(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
+  };
 
   const [uaState, capState] = await (async () => {
     if (!keepId) return [{}, {}];
@@ -1431,10 +1554,12 @@ router.get("/admin/ops", async (req, env: Environment) => {
   return createJsonResponse({
     ok: true,
     now: new Date(now).toISOString(),
+    strict_delivery: strictDelivery,
     warmap,
     webhooks,
+    metrics,
     ...(keepId ? { uaState, capState } : {}),
-    hint: "Actions: ?action=clear-cooldowns | ?action=reset-ua&keep=<id> | ?action=clear-cap&keep=<id>&realm=<Realm>[&prev=<Realm>]. Add ?keep=<id>[&realm=<Realm>][&prev=<Realm>] to inspect keys.",
+    hint: "Actions: ?action=strict-on|strict-off | ?action=clear-cooldowns | ?action=clear-metrics | ?action=reset-all-ua | ?action=reset-ua&keep=<id> | ?action=clear-cap&keep=<id>&realm=<Realm>[&prev=<Realm>]. Add ?keep=<id>[&realm=<Realm>][&prev=<Realm>] to inspect keys.",
   });
 });
 
@@ -1602,16 +1727,27 @@ async function safeDelete(env: Environment, key: string) {
   }
 }
 
-// --- alert from recent "captured" rows, with Fix A once-per keep+owner gate
-// --- alert from recent "captured" rows, with Fix A once-per keep+owner gate
-// --- alert from recent "captured" rows, with unified dedupe keys
 // --- alert from recent "captured" rows, unified dedupe, no baseline short-circuit
+// --- alert from recent "captured" rows, unified dedupe, STRICT_DELIVERY gating
 async function alertOnRecentCapturesFromEvents(
   env: Environment,
   payload: WarmapData
 ) {
   const now = Date.now();
   const WINDOW_MS = captureWindowMs(env);
+  const STRICT_DELIVERY = await getStrictDelivery(env);
+
+
+  // helper: post-capture UA/session state changes
+  async function applyPostCaptureState(keepId: string) {
+    await Promise.all([
+      safeDelete(env, `alert:ua:start:${keepId}`),
+      safePutIfChanged(env, `ua:state:${keepId}`, "0"),
+      safePutIfChanged(env, `ua:suppress:${keepId}`, "1", {
+        expirationTtl: UA_SUPPRESS_AFTER_CAPTURE_SEC,
+      }),
+    ]);
+  }
 
   for (const ev of payload.events) {
     if (ev.kind !== "captured") continue;
@@ -1620,14 +1756,15 @@ async function alertOnRecentCapturesFromEvents(
     if (Number.isNaN(atMs) || now - atMs > WINDOW_MS) continue;
 
     // Unified dedupe gates (shared with ownership path)
-    const onceKey = capOnceKey(ev.keepId, ev.newOwner!);               // 20 min
+    const onceKey = capOnceKey(ev.keepId, ev.newOwner!); // 20 min
     if (await env.WARMAP.get(onceKey)) continue;
 
-    const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at);          // 6 h
+    const kAny = capDedupKey(ev.keepId, ev.newOwner!, ev.at); // 6 h
     if (await env.WARMAP.get(kAny)) continue;
 
     if (await hasAlertedCapture(env, ev.keepId, ev.newOwner!)) continue; // 20 min
 
+    // Send
     const ok = await notifyDiscordCapture(env, {
       keepName: ev.keepName,
       newOwner: ev.newOwner!,
@@ -1635,6 +1772,7 @@ async function alertOnRecentCapturesFromEvents(
       leader: (ev as any).leader,
     });
 
+    // Stamp dedupe keys ONLY on success
     if (ok) {
       await Promise.all([
         markCaptureAlerted(env, ev.keepId, ev.newOwner!),
@@ -1643,16 +1781,15 @@ async function alertOnRecentCapturesFromEvents(
       ]);
     }
 
-    // Always end UA + briefly suppress post-capture flames
-    await Promise.all([
-      safeDelete(env, `alert:ua:start:${ev.keepId}`),
-      safePutIfChanged(env, `ua:state:${ev.keepId}`, "0"),
-      safePutIfChanged(env, `ua:suppress:${ev.keepId}`, "1", {
-        expirationTtl: UA_SUPPRESS_AFTER_CAPTURE_SEC,
-      }),
-    ]);
+    // UA/session state moves:
+    // - STRICT_DELIVERY=1 -> only if ok (so we can retry later)
+    // - default (0)       -> always (previous behavior)
+    if (ok || !STRICT_DELIVERY) {
+      await applyPostCaptureState(ev.keepId);
+    }
   }
 }
+
 
 
 async function updateWarmap(
