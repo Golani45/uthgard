@@ -82,6 +82,9 @@ function createJsonResponse(data: any, status = 200): Response {
   });
 }
 
+function sleep(ms: number) { return new Promise(resolve => setTimeout(resolve, ms)); }
+
+
 const UA_SUPPRESS_AFTER_CAPTURE_SEC = 120;
 
 const ownerMap: Record<string, Realm> = {
@@ -327,6 +330,17 @@ async function note429(env: Environment, url: string, secs: number) {
   await env.WARMAP.put(k, String(secs), { expirationTtl: 3600 }); // 1h
 }
 
+const GLOBAL_CD_KEY = "discord:global:cooldown_until";
+
+async function globalCooldownActive(env: Environment) {
+  const iso = await env.WARMAP.get(GLOBAL_CD_KEY);
+  return iso ? Date.now() < Date.parse(iso) : false;
+}
+async function setGlobalCooldown(env: Environment, secs: number) {
+  const until = new Date(Date.now() + secs * 1000).toISOString();
+  await env.WARMAP.put(GLOBAL_CD_KEY, until, { expirationTtl: Math.ceil(secs) + 1 });
+}
+
 async function postToDiscord(
   env: Environment,
   url: string,
@@ -337,19 +351,23 @@ async function postToDiscord(
     return false;
   }
 
-  // respect any active cooldown we set after a 429
+  // -------- EARLY EXITS (before pacing, before fetch) --------
+  if (await globalCooldownActive(env)) {
+    console.log("discord: GLOBAL cooldown active");
+    // optional: record a skip metric, but don't hammer Discord
+    return false;
+  }
   if (await discordCooldownActive(env, url)) {
     console.log("discord: cooldown active for", cooldownKeyFor(url));
     await noteCooldownSkip(env, url);
     return false;
   }
 
-  // NEW: global pacing so different webhooks don't braid together
-  await enforceGlobalPacing(env);
+  // -------- pacing (gentle spacing even when not rate-limited) --------
+  await enforceGlobalPacing(env);      // small floor across all webhooks
+  await enforceWebhookPacing(env, url); // per-webhook spacing (with penalty)
 
-  // Per-webhook pacing with penalty-aware spacing
-  await enforceWebhookPacing(env, url);
-
+  // -------- send --------
   const resp = await fetch(url, {
     method: "POST",
     headers: {
@@ -359,26 +377,44 @@ async function postToDiscord(
     body: JSON.stringify(body),
   });
 
+  // -------- rate limit handling --------
   if (resp.status === 429) {
-    const secs = parseRetryAfter(resp);
-    await setDiscordCooldown(env, url, secs);
+    let secs = parseRetryAfter(resp);
+    let txt = "";
+    try { txt = await resp.text(); } catch {}
+
+    // JSON bodies often include { retry_after, global }
+    try {
+      const j = JSON.parse(txt);
+      if (Number(j?.retry_after)) secs = Number(j.retry_after);
+      if (j?.global === true) await setGlobalCooldown(env, secs);
+    } catch { /* not JSON, ignore */ }
+
+    // Header may also indicate global RL
+    if (resp.headers.get("X-RateLimit-Global") === "true") {
+      await setGlobalCooldown(env, secs);
+    }
+
+    await setDiscordCooldown(env, url, secs); // per-webhook cooldown
     await note429(env, url, secs);
-    await bumpPenalty(env, url); // <-- increase spacing next attempts
-    const txt = await resp.text().catch(() => "");
-    console.log("discord 429, backing off secs:", secs, "code:", txt.slice(0, 64));
+    await bumpPenalty(env, url);              // slow future pacing for this webhook
+    console.log("discord 429, backoff secs:", secs, "sample:", txt.slice(0, 64));
     return false;
   }
 
   if (!resp.ok) {
-    console.log("discord error", resp.status, await resp.text().catch(() => "..."));
+    const errTxt = await resp.text().catch(() => "...");
+    console.log("discord error", resp.status, errTxt.slice(0, 128));
     return false;
   }
 
+  // -------- success --------
   await noteWebhookSent(env, url);
-  await noteGlobalSent(env);   // <-- record global last send
-  await clearPenalty(env, url); // <-- reset penalty on success
+  await noteGlobalSent(env);   // record global last send
+  await clearPenalty(env, url);
   return true;
 }
+
 
 function penaltyPrefixFor(url?: string | null): string | null {
   if (!url) return null;
@@ -621,6 +657,7 @@ async function alertOnOwnershipChanges(
     ]);
   }
 
+  type CaptureBatchItem = { embed: any; onOk: () => Promise<void>; };
   const capBatch: CaptureBatchItem[] = [];
 
   for (const k of payload.keeps) {
@@ -657,7 +694,7 @@ async function alertOnOwnershipChanges(
     const onceKey = capOnceKey(k.id, k.owner);
     const kAny = capDedupKey(k.id, k.owner, ev.at);
     if (await env.WARMAP.get(onceKey)) { await safePut(env, ownKey, k.owner); continue; }
-    if (await env.WARMAP.get(kAny))   { await safePut(env, ownKey, k.owner); continue; } // <-- fixed (was ownOwner)
+    if (await env.WARMAP.get(kAny))   { await safePut(env, ownKey, k.owner); continue; }
     if (await hasAlertedCapture(env, k.id, k.owner)) { await safePut(env, ownKey, k.owner); continue; }
 
     // ensure only one path/tick queues this capture
@@ -666,7 +703,6 @@ async function alertOnOwnershipChanges(
       continue;
     }
 
-    // queue embed (batched send later)
     const leaderSuffix = (ev as any).leader ? ` — led by ${(ev as any).leader}` : "";
     const embed = {
       title: `🏰 ${k.name} was captured by ${k.owner}${leaderSuffix}`,
@@ -705,6 +741,9 @@ async function alertOnOwnershipChanges(
       } else {
         console.log("capture batch send failed; strict=on → leaving state for retry");
       }
+
+      // NEW: gentle spacing between slices for this webhook
+      await sleep(2500);
     }
   }
 }
@@ -831,7 +870,7 @@ async function alertOnUnderAttackTransitions(
 
   // ---------- HEADER PATH (primary & reliable) ----------
   for (const k of payload.keeps) {
-    const prevKey = `ua:state:${k.id}`; // “on” state (timestamp or "0")
+    const prevKey = `ua:state:${k.id}`;       // “on” state (timestamp or "0")
     const sessionKey = `alert:ua:start:${k.id}`; // one-per-siege
     const dedupeKey = `alert:under:${k.id}:${payload.updatedAt}`;
 
@@ -840,14 +879,12 @@ async function alertOnUnderAttackTransitions(
     const curr = !!k.headerUnderAttack;
     const hasSession = !!(await env.WARMAP.get(sessionKey));
 
-    // --- NEW: short post-capture UA suppressor ---
+    // short post-capture UA suppressor
     const suppressKey = `ua:suppress:${k.id}`;
     const isSuppressed = !!(await env.WARMAP.get(suppressKey));
     if (isSuppressed) {
-      // Make sure we don't resurrect sessions during suppression
       await safePutIfChanged(env, prevKey, "0");
       await safeDelete(env, sessionKey);
-      // Skip any UA send for this keep this tick
       continue;
     }
 
@@ -871,44 +908,29 @@ async function alertOnUnderAttackTransitions(
           embed,
           kind: "header",
           onOk: async () => {
-            // begin siege session & per-payload dedupe
-            await safePutIfChanged(env, sessionKey, "1", {
-              expirationTtl: ttlSec,
-            });
-            await safePutIfChanged(env, dedupeKey, "1", {
-              expirationTtl: 6 * 60 * 60,
-            });
-
-            // mark UA “on”
-            await safePutIfChanged(env, prevKey, String(Date.now()), {
-              expirationTtl: ttlSec,
-            });
+            await safePutIfChanged(env, sessionKey, "1", { expirationTtl: ttlSec });
+            await safePutIfChanged(env, dedupeKey, "1", { expirationTtl: 6 * 60 * 60 });
+            await safePutIfChanged(env, prevKey, String(Date.now()), { expirationTtl: ttlSec });
             sentHeader++;
           },
         });
       } else {
-        // no send, but ensure UA state is “on”
-        await safePutIfChanged(env, prevKey, String(Date.now()), {
-          expirationTtl: ttlSec,
-        });
+        await safePutIfChanged(env, prevKey, String(Date.now()), { expirationTtl: ttlSec });
         skippedHeader++;
       }
     }
-    // Still flaming — don’t resend, just keep TTL fresh
+    // Still flaming — refresh TTLs
     else if (curr && prev) {
-      await safePutIfChanged(env, prevKey, String(Date.now()), {
-        expirationTtl: ttlSec,
-      });
+      await safePutIfChanged(env, prevKey, String(Date.now()), { expirationTtl: ttlSec });
       if (hasSession) {
         await safePutIfChanged(env, sessionKey, "1", { expirationTtl: ttlSec });
       }
       skippedHeader++;
     }
-    // Flame went out — clear state and end session
+    // Flame cleared — reset
     else if (!curr && prev) {
       await safePutIfChanged(env, prevKey, "0");
       await safeDelete(env, sessionKey);
-      // optional: also clear any old header throttle if you ever used it
       await safeDelete(env, `alert:ua:header:${k.id}`);
       resetHeader++;
     }
@@ -924,31 +946,16 @@ async function alertOnUnderAttackTransitions(
   for (const ev of payload.events) {
     if (ev.kind !== "underAttack") continue;
     const k = byId.get(ev.keepId);
-    if (!k) {
-      missing++;
-      continue;
-    }
-
-    // If header is flaming, header path governs sessioning
-    if (k.headerUnderAttack) continue;
-
-    // --- NEW: suppressor also applies to fallback path ---
-    if (await env.WARMAP.get(`ua:suppress:${k.id}`)) {
-      continue;
-    }
+    if (!k) { missing++; continue; }
+    if (k.headerUnderAttack) continue; // header governs
+    if (await env.WARMAP.get(`ua:suppress:${k.id}`)) continue; // suppressor
 
     considered++;
 
     const nobannerKey = `alert:ua:nobanner:${ev.keepId}`;
     const dedupeKey = `alert:under:${ev.keepId}:${ev.at}`;
-    if (await env.WARMAP.get(nobannerKey)) {
-      deduped++;
-      continue;
-    }
-    if (await env.WARMAP.get(dedupeKey)) {
-      deduped++;
-      continue;
-    }
+    if (await env.WARMAP.get(nobannerKey)) { deduped++; continue; }
+    if (await env.WARMAP.get(dedupeKey))   { deduped++; continue; }
 
     const embed = {
       title: `⚔️ ${k.name} is under attack!`,
@@ -967,26 +974,10 @@ async function alertOnUnderAttackTransitions(
       embed,
       kind: "fallback",
       onOk: async () => {
-        await safePutIfChanged(env, nobannerKey, "1", {
-          expirationTtl: suppressTtl,
-        });
-        await safePutIfChanged(env, dedupeKey, "1", {
-          expirationTtl: 6 * 60 * 60,
-        });
-
-        // Mark a siege session so header & fallback behave as one
-        await safePutIfChanged(env, `alert:ua:start:${ev.keepId}`, "1", {
-          expirationTtl: ttlSec,
-        });
-
-        // Also mark UA “on” so subsequent ticks treat it as flaming even if the next event is late
-        await safePutIfChanged(
-          env,
-          `ua:state:${ev.keepId}`,
-          String(Date.now()),
-          { expirationTtl: ttlSec }
-        );
-
+        await safePutIfChanged(env, nobannerKey, "1", { expirationTtl: suppressTtl });
+        await safePutIfChanged(env, dedupeKey, "1", { expirationTtl: 6 * 60 * 60 });
+        await safePutIfChanged(env, `alert:ua:start:${ev.keepId}`, "1", { expirationTtl: ttlSec });
+        await safePutIfChanged(env, `ua:state:${ev.keepId}`, String(Date.now()), { expirationTtl: ttlSec });
         sent++;
       },
     });
@@ -1002,16 +993,16 @@ async function alertOnUnderAttackTransitions(
         embeds,
       });
       if (ok) await Promise.all(slice.map((b) => b.onOk()));
+
+      // NEW: gentle spacing between slices for this webhook
+      await sleep(2500);
     }
   }
 
-  console.log(
-    `header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`
-  );
-  console.log(
-    `fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`
-  );
+  console.log(`header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`);
+  console.log(`fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`);
 }
+
 
 const WEBHOOK_MIN_INTERVAL_MS = 8000;
 
@@ -1488,15 +1479,16 @@ if (action === "clear-cooldowns") {
     env.DISCORD_WEBHOOK_URL_PLAYERS,
   ].filter(Boolean) as string[];
 
-  for (const u of targets) {
-    await Promise.allSettled([
-      safeDelete(env, cooldownKeyFor(u)),
-      safeDelete(env, lastSendKeyFor(u)),
-      safeDelete(env, penaltyPrefixFor(u)!), // NEW: remove penalty for this webhook
-    ]);
-  }
-  // NEW: also clear global last
-  await safeDelete(env, globalLastKey());
+for (const u of targets) {
+  await Promise.allSettled([
+    safeDelete(env, cooldownKeyFor(u)),
+    safeDelete(env, lastSendKeyFor(u)),
+    safeDelete(env, penaltyKey(u)), // <-- use the actual key, not a prefix
+  ]);
+}
+await safeDelete(env, globalLastKey());
+await safeDelete(env, "discord:global:cooldown_until");
+
   return createJsonResponse({ ok: true, did: "clear-cooldowns", count: targets.length });
 }
 
@@ -1827,6 +1819,7 @@ async function alertOnRecentCapturesFromEvents(
     ]);
   }
 
+  type CaptureBatchItem = { embed: any; onOk: () => Promise<void>; };
   const capBatch: CaptureBatchItem[] = [];
 
   for (const ev of payload.events) {
@@ -1885,9 +1878,13 @@ async function alertOnRecentCapturesFromEvents(
       } else {
         console.log("events-path capture batch failed; strict=on → leaving state for retry");
       }
+
+      // NEW: gentle spacing between slices for this webhook
+      await sleep(2500);
     }
   }
 }
+
 
 
 
