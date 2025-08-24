@@ -7,8 +7,11 @@ interface Environment {
   HERALD_WARMAP_URL: string;
   ATTACK_WINDOW_MIN?: string;
   DISCORD_WEBHOOK_URL?: string;
+  DISCORD_WEBHOOK_URL_UA_2?: string;
+  DISCORD_WEBHOOK_URL_UA_3?: string;
   DISCORD_WEBHOOK_URL_PLAYERS?: string; // player activity
   DISCORD_WEBHOOK_CAPTURE?: string; // capture activity
+  DISCORD_WEBHOOK_URL_CAPTURE_2?: string;
   TRACKED_PLAYERS?: string; // ⬅️ stringified JSON
   ACTIVITY_SESSION_MIN?: string; // ⬅️ minutes to treat as one "session" (default 30)
   CAPTURE_WINDOW_MIN?: string; // how recent a "captured" can be to alert (default 12)
@@ -70,6 +73,12 @@ interface Keep {
   emblem?: string | null;
 }
 
+type ChannelType = "ua" | "capture" | "players";
+function activeWebhookKey(t: ChannelType) { return `discord:active:${t}`; }
+
+// How long to stick to the chosen webhook (minutes)
+const STICKY_TTL_MIN = 30;
+
 // Response utility
 function createJsonResponse(data: any, status = 200): Response {
   return new Response(JSON.stringify(data), {
@@ -106,6 +115,23 @@ function capClaimKey(keepId: string, newOwner: Realm, atIso: string) {
   bucket.setSeconds(0, 0);
   return `cap:claim:${keepId}:${newOwner}:${bucket.toISOString()}`;
 }
+
+async function postToDiscordWithFallbackSticky(
+  env: Environment, type: ChannelType, urls: string[], body: any
+): Promise<{ ok: boolean; used?: string }> {
+  if (!urls.length) return { ok:false };
+
+  // Always prefer canonical order; “fallback” only when a URL is actively cooled down or errors.
+  for (const url of urls) {
+    if (await globalCooldownActive(env)) return { ok:false };
+    if (await discordCooldownActive(env, url)) { await noteCooldownSkip(env, url); continue; }
+
+    const ok = await postToDiscord(env, url, body);
+    if (ok) return { ok:true, used:url };
+  }
+  return { ok:false };
+}
+
 
 const GLOBAL_MIN_INTERVAL_MS = 6000; // small global floor across all webhooks
 function globalLastSendKey() { return "discord:global:last"; }
@@ -151,6 +177,19 @@ async function tryClaimCapture(
   await safePutIfChanged(env, key, "1", { expirationTtl: 120 }); // short lived
   return true;
 }
+
+function uaClaimKey(keepId: string, stamp: string) {
+  return `ua:claim:${keepId}:${stamp}`;
+}
+
+async function tryClaimUA(env: Environment, keepId: string, stamp: string) {
+  const k = uaClaimKey(keepId, stamp);
+  const existed = await env.WARMAP.get(k);
+  if (existed) return false; // another isolate already "owns" this UA alert
+  await safePutIfChanged(env, k, "1", { expirationTtl: 120 }); // 2m claim
+  return true;
+}
+
 function normRealm(r: string): Realm | null {
   const t = r.toLowerCase();
   if (t.startsWith("alb")) return "Albion";
@@ -368,7 +407,9 @@ async function postToDiscord(
   await enforceWebhookPacing(env, url); // per-webhook spacing (with penalty)
 
   // -------- send --------
-  const resp = await fetch(url, {
+let resp: Response;
+try {
+  resp = await fetch(url, {
     method: "POST",
     headers: {
       "content-type": "application/json",
@@ -376,46 +417,63 @@ async function postToDiscord(
     },
     body: JSON.stringify(body),
   });
+} catch (e) {
+  // transient network/CF errors → short cooldown + penalty to avoid hammering
+  await setDiscordCooldown(env, url, 5);
+  await bumpPenalty(env, url);
+  console.log("discord fetch error:", String((e as any)?.message ?? e));
+  return false;
+}
 
   // -------- rate limit handling --------
-  if (resp.status === 429) {
-    let secs = parseRetryAfter(resp);
-    let txt = "";
-    try { txt = await resp.text(); } catch {}
+if (resp.status === 429 || resp.status === 1015) {
+  let secs = parseRetryAfter(resp); // already handles decimals / missing
+  let txt = "";
+  try { txt = await resp.text(); } catch {}
 
-    // JSON bodies often include { retry_after, global }
-    try {
-      const j = JSON.parse(txt);
-      if (Number(j?.retry_after)) secs = Number(j.retry_after);
-      if (j?.global === true) await setGlobalCooldown(env, secs);
-    } catch { /* not JSON, ignore */ }
+  try {
+    const j = JSON.parse(txt);
+    if (Number(j?.retry_after)) secs = Number(j.retry_after);
+    if (j?.global === true) await setGlobalCooldown(env, secs);
+  } catch {}
 
-    // Header may also indicate global RL
-    if (resp.headers.get("X-RateLimit-Global") === "true") {
-      await setGlobalCooldown(env, secs);
-    }
-
-    await setDiscordCooldown(env, url, secs); // per-webhook cooldown
-    await note429(env, url, secs);
-    await bumpPenalty(env, url);              // slow future pacing for this webhook
-    console.log("discord 429, backoff secs:", secs, "sample:", txt.slice(0, 64));
-    return false;
+  if (resp.headers.get("X-RateLimit-Global") === "true") {
+    await setGlobalCooldown(env, secs);
   }
 
-  if (!resp.ok) {
-    const errTxt = await resp.text().catch(() => "...");
-    console.log("discord error", resp.status, errTxt.slice(0, 128));
-    return false;
-  }
-
-// after a successful POST
-const { remaining, resetAfter } = readRateHeaders(resp);
-
-// If we're about to exhaust the bucket, proactively pause THIS webhook
-if (remaining !== null && remaining <= 1) {
-  const backoffSecs = Math.max(1, Math.ceil(resetAfter ?? 1));
-  await setDiscordCooldown(env, url, backoffSecs);
+  await setDiscordCooldown(env, url, secs);
+  await note429(env, url, secs);
+  await bumpPenalty(env, url);
+  console.log(`discord RL ${resp.status}, backoff secs:`, secs, "sample:", txt.slice(0,64));
+  return false;
 }
+
+// -------- transient server-side errors (Discord/CF 5xx) --------
+if (resp.status >= 500) {
+  const ra = Number(resp.headers.get("Retry-After"));
+  if (Number.isFinite(ra) && ra > 0) await setDiscordCooldown(env, url, ra);
+  else await setDiscordCooldown(env, url, 5);
+  await bumpPenalty(env, url);
+  const errTxt = await resp.text().catch(() => "...");
+  console.log("discord 5xx", resp.status, errTxt.slice(0, 128));
+  return false;
+}
+
+// -------- non-OK (other 4xx) --------
+if (!resp.ok) {
+  const errTxt = await resp.text().catch(() => "...");
+  console.log("discord error", resp.status, errTxt.slice(0, 128));
+  return false;
+}
+
+  // after a successful POST
+  const { remaining, resetAfter } = readRateHeaders(resp);
+
+  // If we're about to exhaust the bucket, proactively pause THIS webhook
+  if (remaining !== null && remaining <= 1) {
+    const backoffSecs = Math.max(1, Math.ceil(resetAfter ?? 1));
+    await setDiscordCooldown(env, url, backoffSecs);
+  }
 
   // -------- success --------
   await noteWebhookSent(env, url);
@@ -424,6 +482,63 @@ if (remaining !== null && remaining <= 1) {
   return true;
 }
 
+// Build ordered candidates for each channel
+function UA_WEBHOOKS(env: Environment): string[] {
+  return [
+    env.DISCORD_WEBHOOK_URL,
+    env.DISCORD_WEBHOOK_URL_UA_2,
+    env.DISCORD_WEBHOOK_URL_UA_3,
+  ].filter(Boolean) as string[];
+}
+
+function CAPTURE_WEBHOOKS(env: Environment): string[] {
+  return [
+    env.DISCORD_WEBHOOK_CAPTURE,
+    env.DISCORD_WEBHOOK_URL_CAPTURE_2,
+  ].filter(Boolean) as string[];
+}
+// Convenience wrappers for slices of embeds
+async function sendEmbedsUAWithFallback(env: Environment, embeds: any[]): Promise<boolean> {
+  return await withChannelGate(env, "ua", async () => {
+    const urls = UA_WEBHOOKS(env);
+    if (urls.length === 0) return false;
+    const res = await postToDiscordWithFallbackSticky(env, "ua", urls, {
+      username: WEBHOOK_USERNAME,
+      embeds,
+    });
+    return res.ok;
+  });
+}
+
+
+async function sendEmbedsCaptureWithFallback(env: Environment, embeds: any[]): Promise<boolean> {
+  return await withChannelGate(env, "capture", async () => {
+    const urls = CAPTURE_WEBHOOKS(env);
+    if (urls.length === 0) return false;
+    const res = await postToDiscordWithFallbackSticky(env, "capture", urls, {
+      username: WEBHOOK_USERNAME,
+      embeds,
+    });
+    return res.ok;
+  });
+}
+
+async function tryClaimGate(env: Environment, key: string, ttlSec: number) {
+  const existed = await env.WARMAP.get(key);
+  if (existed) return false;
+  await safePutIfChanged(env, key, "1", { expirationTtl: ttlSec });
+  return true;
+}
+
+async function withChannelGate<T>(env: Environment, type: ChannelType, fn: () => Promise<T>): Promise<T> {
+  const key = `discord:gate:${type}`;
+  const ok = await tryClaimGate(env, key, 5); // 5s is enough to serialize bursts
+  try {
+    return await fn();
+  } finally {
+    if (ok) await safeDelete(env, key);
+  }
+}
 
 function penaltyPrefixFor(url?: string | null): string | null {
   if (!url) return null;
@@ -466,6 +581,12 @@ function cooldownKeyFor(url: string) {
   } catch {
     return `discord:cooldown:${url.slice(-16)}`;
   }
+}
+
+function minuteBucketIso(s: string) {
+  const d = new Date(s);
+  d.setSeconds(0, 0);
+  return d.toISOString();
 }
 
 function readRateHeaders(resp: Response) {
@@ -750,26 +871,25 @@ async function alertOnOwnershipChanges(
   }
 
   // single POST (chunk embeds by 10 to satisfy Discord)
-  if (capBatch.length > 0 && env.DISCORD_WEBHOOK_CAPTURE) {
-    for (let i = 0; i < capBatch.length; i += 10) {
-      const slice = capBatch.slice(i, i + 10);
-      const embeds = slice.map(b => b.embed);
-      const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_CAPTURE, {
-        username: WEBHOOK_USERNAME,
-        embeds,
-      });
-      if (ok) {
-        await Promise.all(slice.map(b => b.onOk()));
-      } else if (!STRICT_DELIVERY) {
-        await Promise.all(slice.map(b => b.onOk())); // freshness-first
-      } else {
-        console.log("capture batch send failed; strict=on → leaving state for retry");
-      }
+// single POST (chunk embeds by 10; try capture fallbacks)
+if (capBatch.length > 0 && CAPTURE_WEBHOOKS(env).length > 0) {
+  for (let i = 0; i < capBatch.length; i += 10) {
+    const slice = capBatch.slice(i, i + 10);
+    const embeds = slice.map(b => b.embed);
 
-      // NEW: gentle spacing between slices for this webhook
-      await sleep(2500);
+    const ok = await sendEmbedsCaptureWithFallback(env, embeds);
+    if (ok) {
+      await Promise.all(slice.map(b => b.onOk()));
+    } else if (!STRICT_DELIVERY) {
+      await Promise.all(slice.map(b => b.onOk())); // freshness-first
+    } else {
+      console.log("capture batch send failed (all fallbacks); strict=on → leaving state for retry");
     }
+
+    await sleep(2500);
   }
+}
+
 }
 
 
@@ -795,11 +915,11 @@ const WEBHOOK_USERNAME = "Uthgard Herald";
 const WEBHOOK_AVATAR = ""; // e.g. https://your-cdn/avatar.png
 
 //flame
+//flame (UA) — uses fallback webhooks
 async function notifyDiscord(
   env: Environment,
   e: { keepId: string; at: string; keep: Keep }
 ): Promise<boolean> {
-  const url = env.DISCORD_WEBHOOK_URL; // UA/capture webhook
   const key = `alert:under:${e.keepId}:${e.at}`;
   if (await env.WARMAP.get(key)) return false;
 
@@ -817,20 +937,18 @@ async function notifyDiscord(
     ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
   };
 
-  const ok = await postToDiscord(env, url!, {
-    username: "Uthgard Herald",
-    embeds: [embed],
-  });
+  const ok = await sendEmbedsUAWithFallback(env, [embed]);
   if (ok) await safePutIfChanged(env, key, "1", { expirationTtl: 6 * 60 * 60 });
   return ok;
 }
 
+
 //keep capture
+//keep capture — uses fallback webhooks
 async function notifyDiscordCapture(
   env: Environment,
   ev: { keepName: string; newOwner: Realm; at: string; leader?: string }
-) {
-  const url = env.DISCORD_WEBHOOK_CAPTURE;
+): Promise<boolean> {
   const leaderSuffix = ev.leader ? ` — led by ${ev.leader}` : "";
   const embed = {
     title: `🏰 ${ev.keepName} was captured by ${ev.newOwner}${leaderSuffix}`,
@@ -838,24 +956,11 @@ async function notifyDiscordCapture(
     timestamp: ev.at,
     footer: { text: "Uthgard Herald watch" },
   };
-  return await postToDiscord(env, url!, {
-    username: "Uthgard Herald",
-    embeds: [embed],
-  });
+  return await sendEmbedsCaptureWithFallback(env, [embed]);
 }
 
 //player
-async function notifyDiscordPlayer(
-  env: Environment,
-  p: { name: string; realm: string },
-  delta: number
-): Promise<boolean> {
-  const url = env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL;
-  if (!url) {
-    console.log("no webhook configured for player alerts");
-    return false;
-  }
-
+async function notifyDiscordPlayer(env: Environment, p: { name: string; realm: string }, delta: number): Promise<boolean> {
   const realm = normRealm(p.realm) ?? "Midgard";
   const color = REALM_COLOR[realm];
   const embed = {
@@ -867,11 +972,18 @@ async function notifyDiscordPlayer(
     footer: { text: "Poofter Saz Watch" },
   };
 
-  return await postToDiscord(env, url, {
-    username: "Uthgard Herald",
-    embeds: [embed],
+  const urls = [env.DISCORD_WEBHOOK_URL_PLAYERS].filter(Boolean) as string[];
+  if (urls.length === 0) { console.log("no webhook configured for player alerts"); return false; }
+
+  return await withChannelGate(env, "players", async () => {
+    const res = await postToDiscordWithFallbackSticky(env, "players", urls, {
+      username: "Uthgard Herald",
+      embeds: [embed],
+    });
+    return res.ok;
   });
 }
+
 
 async function alertOnUnderAttackTransitions(
   env: Environment,
@@ -894,10 +1006,8 @@ async function alertOnUnderAttackTransitions(
 
   // ---------- HEADER PATH (primary & reliable) ----------
   for (const k of payload.keeps) {
-    const prevKey = `ua:state:${k.id}`;       // “on” state (timestamp or "0")
+    const prevKey = `ua:state:${k.id}`;          // “on” state (timestamp or "0")
     const sessionKey = `alert:ua:start:${k.id}`; // one-per-siege
-    const dedupeKey = `alert:under:${k.id}:${payload.updatedAt}`;
-
     const prevRaw = await env.WARMAP.get(prevKey);
     const prev = !!(prevRaw && prevRaw !== "0");
     const curr = !!k.headerUnderAttack;
@@ -912,36 +1022,48 @@ async function alertOnUnderAttackTransitions(
       continue;
     }
 
-    // Rising edge
+    // FIX: only attempt a claim on a true rising edge, and only with a minute-bucketed stamp.
     if (curr && !prev) {
-      if (!hasSession && !(await env.WARMAP.get(dedupeKey))) {
-        const embed = {
-          title: `⚔️ ${k.name} is under attack!`,
-          color: REALM_COLOR[k.owner],
-          fields: [
-            { name: "Owner", value: k.owner, inline: true },
-            { name: "Level", value: String(k.level ?? "—"), inline: true },
-            { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
-          ],
-          timestamp: new Date(payload.updatedAt).toISOString(),
-          footer: { text: "Uthgard Herald watch" },
-          ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
-        };
+      const stamp = minuteBucketIso(payload.updatedAt); // shared stamp across isolates in same minute
+      const dedupeKey = `alert:under:${k.id}:${stamp}`;
 
-        batch.push({
-          embed,
-          kind: "header",
-          onOk: async () => {
-            await safePutIfChanged(env, sessionKey, "1", { expirationTtl: ttlSec });
-            await safePutIfChanged(env, dedupeKey, "1", { expirationTtl: 6 * 60 * 60 });
-            await safePutIfChanged(env, prevKey, String(Date.now()), { expirationTtl: ttlSec });
-            sentHeader++;
-          },
-        });
-      } else {
+      if (hasSession || (await env.WARMAP.get(dedupeKey))) {
+        // another path/session already sent for this minute-rise
         await safePutIfChanged(env, prevKey, String(Date.now()), { expirationTtl: ttlSec });
         skippedHeader++;
+        continue;
       }
+
+      // FIX: single claim attempt with the SAME stamp used for dedupe
+      if (!(await tryClaimUA(env, k.id, stamp))) {
+        // someone else claimed; don't mark UA "on" here so we can retry if they fail to send
+        skippedHeader++;
+        continue;
+      }
+
+      const embed = {
+        title: `⚔️ ${k.name} is under attack!`,
+        color: REALM_COLOR[k.owner],
+        fields: [
+          { name: "Owner", value: k.owner, inline: true },
+          { name: "Level", value: String(k.level ?? "—"), inline: true },
+          { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
+        ],
+        timestamp: new Date(payload.updatedAt).toISOString(),
+        footer: { text: "Uthgard Herald watch" },
+        ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
+      };
+
+      batch.push({
+        embed,
+        kind: "header",
+        onOk: async () => {
+          await safePutIfChanged(env, sessionKey, "1", { expirationTtl: ttlSec });
+          await safePutIfChanged(env, dedupeKey, "1", { expirationTtl: 6 * 60 * 60 });
+          await safePutIfChanged(env, prevKey, String(Date.now()), { expirationTtl: ttlSec });
+          sentHeader++;
+        },
+      });
     }
     // Still flaming — refresh TTLs
     else if (curr && prev) {
@@ -955,7 +1077,7 @@ async function alertOnUnderAttackTransitions(
     else if (!curr && prev) {
       await safePutIfChanged(env, prevKey, "0");
       await safeDelete(env, sessionKey);
-      await safeDelete(env, `alert:ua:header:${k.id}`);
+      await safeDelete(env, `alert:ua:header:${k.id}`); // legacy/optional cleanup
       resetHeader++;
     }
   }
@@ -977,9 +1099,15 @@ async function alertOnUnderAttackTransitions(
     considered++;
 
     const nobannerKey = `alert:ua:nobanner:${ev.keepId}`;
-    const dedupeKey = `alert:under:${ev.keepId}:${ev.at}`;
+    // FIX (optional but safer): minute-bucket the fallback stamp too
+    const stampFB = minuteBucketIso(ev.at);
+    const dedupeKey = `alert:under:${ev.keepId}:${stampFB}`;
+
     if (await env.WARMAP.get(nobannerKey)) { deduped++; continue; }
     if (await env.WARMAP.get(dedupeKey))   { deduped++; continue; }
+
+    // FIX: claim using the SAME minute-bucketed stamp as dedupe
+    if (!(await tryClaimUA(env, ev.keepId, stampFB))) { deduped++; continue; }
 
     const embed = {
       title: `⚔️ ${k.name} is under attack!`,
@@ -989,7 +1117,7 @@ async function alertOnUnderAttackTransitions(
         { name: "Level", value: String(k.level ?? "—"), inline: true },
         { name: "Claimed by", value: k.claimedBy ?? "—", inline: true },
       ],
-      timestamp: new Date(ev.at).toISOString(),
+      timestamp: new Date(ev.at).toISOString(), // keep precise wall time in the embed
       footer: { text: "Uthgard Herald watch" },
       ...(k.emblem ? { thumbnail: { url: k.emblem } } : {}),
     };
@@ -1007,18 +1135,16 @@ async function alertOnUnderAttackTransitions(
     });
   }
 
-  // ---------- send ----------
-  if (batch.length > 0 && env.DISCORD_WEBHOOK_URL) {
+  // ---------- send (with UA fallbacks) ----------
+  if (batch.length > 0 && UA_WEBHOOKS(env).length > 0) {
     for (let i = 0; i < batch.length; i += 10) {
       const slice = batch.slice(i, i + 10);
       const embeds = slice.map((b) => b.embed);
-      const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_URL, {
-        username: "Uthgard Herald",
-        embeds,
-      });
+
+      const ok = await sendEmbedsUAWithFallback(env, embeds);
       if (ok) await Promise.all(slice.map((b) => b.onOk()));
 
-      // NEW: gentle spacing between slices for this webhook
+      // gentle spacing between slices
       await sleep(2500);
     }
   }
@@ -1026,6 +1152,7 @@ async function alertOnUnderAttackTransitions(
   console.log(`header UA — sent:${sentHeader} skipped:${skippedHeader} reset:${resetHeader}`);
   console.log(`fallback UA — considered:${considered} deduped:${deduped} missing:${missing} sent:${sent}`);
 }
+
 
 
 const WEBHOOK_MIN_INTERVAL_MS = 8000;
@@ -1208,11 +1335,12 @@ function r429PrefixFor(url?: string | null): string | null {
 const router = Router();
 
 router.get("/admin/ping-capture", async (_req, env: Environment) => {
-  const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_CAPTURE!, {
-    username: "Uthgard Herald",
-    embeds: [{ title: "🏰 Ping (Capture)", description: "Capture webhook reachable", timestamp: new Date().toISOString() }],
-  });
-  return createJsonResponse({ ok });
+  const ok = await sendEmbedsCaptureWithFallback(env, [{
+    title: "🏰 Ping (Capture)",
+    description: "Capture webhook(s) reachable",
+    timestamp: new Date().toISOString(),
+  }]);
+  return createJsonResponse({ ok, tried: CAPTURE_WEBHOOKS(env).length });
 });
 
 router.get("/admin/ping-players", async (_req, env: Environment) => {
@@ -1237,11 +1365,12 @@ router.get("/api/warmap.json", async (_req, env: Environment) => {
 });
 
 router.get("/admin/ping", async (_req, env: Environment) => {
-  const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_URL!, {
-    username: "Uthgard Herald",
-    embeds: [{ title: "✅ Ping", description: "Webhook reachable", timestamp: new Date().toISOString() }],
-  });
-  return createJsonResponse({ ok });
+  const ok = await sendEmbedsUAWithFallback(env, [{
+    title: "✅ Ping (UA)",
+    description: "UA webhook(s) reachable",
+    timestamp: new Date().toISOString(),
+  }]);
+  return createJsonResponse({ ok, tried: UA_WEBHOOKS(env).length });
 });
 
 router.get("/admin/test-hook", async (_req, env: Environment) => {
@@ -1495,26 +1624,32 @@ router.get("/admin/ops", async (req, env: Environment) => {
     };
   }
 
-  // ----- actions (mutations) -----
-if (action === "clear-cooldowns") {
-  const targets = [
-    env.DISCORD_WEBHOOK_URL,
-    env.DISCORD_WEBHOOK_CAPTURE,
-    env.DISCORD_WEBHOOK_URL_PLAYERS,
-  ].filter(Boolean) as string[];
+    // ----- actions (mutations) -----
+  if (action === "clear-cooldowns") {
+    const targets = [
+      ...UA_WEBHOOKS(env),
+      ...CAPTURE_WEBHOOKS(env),
+      (env.DISCORD_WEBHOOK_URL_PLAYERS ?? null),
+    ].filter(Boolean) as string[];
 
-for (const u of targets) {
-  await Promise.allSettled([
-    safeDelete(env, cooldownKeyFor(u)),
-    safeDelete(env, lastSendKeyFor(u)),
-    safeDelete(env, penaltyKey(u)), // <-- use the actual key, not a prefix
-  ]);
-}
-await safeDelete(env, globalLastKey());
-await safeDelete(env, "discord:global:cooldown_until");
+    for (const u of targets) {
+      await Promise.allSettled([
+        safeDelete(env, cooldownKeyFor(u)),
+        safeDelete(env, lastSendKeyFor(u)),
+        safeDelete(env, penaltyKey(u)),
+      ]);
+    }
+    await Promise.allSettled([
+      safeDelete(env, globalLastKey()),
+      safeDelete(env, "discord:global:cooldown_until"),
+      safeDelete(env, activeWebhookKey("ua")),
+      safeDelete(env, activeWebhookKey("capture")),
+      safeDelete(env, activeWebhookKey("players")),
+    ]);
 
-  return createJsonResponse({ ok: true, did: "clear-cooldowns", count: targets.length });
-}
+    return createJsonResponse({ ok: true, did: "clear-cooldowns", count: targets.length });
+  }
+
 
   if (action === "reset-ua") {
     if (!keepId) return createJsonResponse({ ok: false, error: "missing ?keep" }, 400);
@@ -1559,22 +1694,21 @@ await safeDelete(env, "discord:global:cooldown_until");
   }
 
 if (action === "clear-metrics") {
-  let cleared = 0;
-  const prefixes = [
-    r429PrefixFor(env.DISCORD_WEBHOOK_URL),
-    r429PrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
-    r429PrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
-    skipPrefixFor(env.DISCORD_WEBHOOK_URL),
-    skipPrefixFor(env.DISCORD_WEBHOOK_CAPTURE),
-    skipPrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
-    penaltyPrefixFor(env.DISCORD_WEBHOOK_URL),             // NEW
-    penaltyPrefixFor(env.DISCORD_WEBHOOK_CAPTURE),         // NEW
-    penaltyPrefixFor(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL), // NEW
+  const urlsAll = [
+    ...UA_WEBHOOKS(env),
+    ...CAPTURE_WEBHOOKS(env),
+    (env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL ?? null),
   ].filter(Boolean) as string[];
-  for (const p of prefixes) cleared += await clearByPrefix(env, p);
-  await safeDelete(env, globalLastKey()); // NEW
+
+  let cleared = 0;
+  for (const u of urlsAll) {
+    const prefixes = [r429PrefixFor(u), skipPrefixFor(u), penaltyPrefixFor(u)].filter(Boolean) as string[];
+    for (const p of prefixes) cleared += await clearByPrefix(env, p);
+  }
+  await safeDelete(env, globalLastKey());
   return createJsonResponse({ ok: true, did: "clear-metrics", cleared });
 }
+
 
   // ----- read-only health snapshot -----
   const wm = await env.WARMAP.get<WarmapData>("warmap", "json");
@@ -1592,19 +1726,23 @@ if (action === "clear-metrics") {
   const strictDeliveryKV = await env.WARMAP.get("flags:strict_delivery");
   const strictDelivery = (strictDeliveryKV ?? String(env.STRICT_DELIVERY ?? "0")).trim() === "1";
 
-  async function metricBundle(url?: string | null) {
-    const skipP = skipPrefixFor(url);
-    const r429P = r429PrefixFor(url);
-    const cooldownSkips = skipP ? await countByPrefix(env, skipP) : 0;
-    const r429s = r429P ? await countByPrefix(env, r429P) : 0;
-    return { cooldown_skips: cooldownSkips, r429_last_hour: r429s };
+async function metricBundleAll(urls: string[]): Promise<{ cooldown_skips: number; r429_last_hour: number }> {
+  let cooldown_skips = 0;
+  let r429_last_hour = 0;
+  for (const u of urls) {
+    const sp = skipPrefixFor(u);
+    const rp = r429PrefixFor(u);
+    if (sp) cooldown_skips += await countByPrefix(env, sp);
+    if (rp) r429_last_hour += await countByPrefix(env, rp);
   }
+  return { cooldown_skips, r429_last_hour };
+}
 
-  const metrics = {
-    ua: await metricBundle(env.DISCORD_WEBHOOK_URL),
-    capture: await metricBundle(env.DISCORD_WEBHOOK_CAPTURE),
-    players: await metricBundle(env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL),
-  };
+const metrics = {
+  ua: await metricBundleAll(UA_WEBHOOKS(env)),
+  capture: await metricBundleAll(CAPTURE_WEBHOOKS(env)),
+  players: await metricBundleAll([env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL!].filter(Boolean) as string[]),
+};
 
   const [uaState, capState] = await (async () => {
     if (!keepId) return [{}, {}];
@@ -1640,12 +1778,14 @@ if (action === "clear-metrics") {
       },
     ];
   })();
-
-  const webhooks = await Promise.all([
-    readWebhookState("UA/Generic", env.DISCORD_WEBHOOK_URL ?? null),
-    readWebhookState("Capture", env.DISCORD_WEBHOOK_CAPTURE ?? null),
-    readWebhookState("Players", env.DISCORD_WEBHOOK_URL_PLAYERS ?? null),
-  ]);
+const webhooks = await Promise.all([
+  // UA (1/2/3)
+  ...UA_WEBHOOKS(env).map((u, i) => readWebhookState(`UA/${i+1}`, u)),
+  // Capture (1/2)
+  ...CAPTURE_WEBHOOKS(env).map((u, i) => readWebhookState(`Capture/${i+1}`, u)),
+  // Players
+  readWebhookState("Players", env.DISCORD_WEBHOOK_URL_PLAYERS ?? env.DISCORD_WEBHOOK_URL ?? null),
+]);
 
   return createJsonResponse({
     ok: true,
@@ -1887,26 +2027,24 @@ async function alertOnRecentCapturesFromEvents(
     });
   }
 
-  if (capBatch.length > 0 && env.DISCORD_WEBHOOK_CAPTURE) {
-    for (let i = 0; i < capBatch.length; i += 10) {
-      const slice = capBatch.slice(i, i + 10);
-      const embeds = slice.map(b => b.embed);
-      const ok = await postToDiscord(env, env.DISCORD_WEBHOOK_CAPTURE, {
-        username: WEBHOOK_USERNAME,
-        embeds,
-      });
-      if (ok) {
-        await Promise.all(slice.map(b => b.onOk()));
-      } else if (!STRICT_DELIVERY) {
-        await Promise.all(slice.map(b => b.onOk()));
-      } else {
-        console.log("events-path capture batch failed; strict=on → leaving state for retry");
-      }
+if (capBatch.length > 0 && CAPTURE_WEBHOOKS(env).length > 0) {
+  for (let i = 0; i < capBatch.length; i += 10) {
+    const slice = capBatch.slice(i, i + 10);
+    const embeds = slice.map(b => b.embed);
 
-      // NEW: gentle spacing between slices for this webhook
-      await sleep(2500);
+    const ok = await sendEmbedsCaptureWithFallback(env, embeds);
+    if (ok) {
+      await Promise.all(slice.map(b => b.onOk()));
+    } else if (!STRICT_DELIVERY) {
+      await Promise.all(slice.map(b => b.onOk()));
+    } else {
+      console.log("events-path capture batch failed (all fallbacks); strict=on → leaving state for retry");
     }
+
+    await sleep(2500);
   }
+}
+
 }
 
 
