@@ -1296,6 +1296,149 @@ router.post(
   }
 );
 
+router.get("/admin/ops", async (req, env: Environment) => {
+  const url = new URL(req.url);
+  const q = url.searchParams;
+
+  const keepId = q.get("keep") ?? undefined;
+  const realm = (q.get("realm") as Realm) ?? undefined;
+  const prev = (q.get("prev") as Realm) ?? undefined;
+  const action = q.get("action") ?? undefined;
+
+  // ----- helpers -----
+  const now = Date.now();
+  const stamp = (d?: string | null) => (d ? new Date(d).toISOString() : null);
+  const secsLeft = (iso?: string | null) =>
+    iso ? Math.max(0, Math.ceil((Date.parse(iso) - now) / 1000)) : 0;
+
+  async function readWebhookState(name: string, url?: string | null) {
+    if (!url) return { name, configured: false };
+    const cdKey = cooldownKeyFor(url);
+    const lastKey = lastSendKeyFor(url);
+    const [until, last] = await Promise.all([
+      env.WARMAP.get(cdKey),
+      env.WARMAP.get(lastKey),
+    ]);
+    return {
+      name,
+      configured: true,
+      cooldown_key: cdKey,
+      cooldown_until: stamp(until),
+      cooldown_secs_remaining: secsLeft(until),
+      last_send_key: lastKey,
+      last_send_ms: last ? Number(last) : null,
+      last_send_iso: last ? new Date(Number(last)).toISOString() : null,
+    };
+  }
+
+  // ----- actions (mutations) -----
+  if (action === "clear-cooldowns") {
+    const targets = [
+      env.DISCORD_WEBHOOK_URL,
+      env.DISCORD_WEBHOOK_CAPTURE,
+      env.DISCORD_WEBHOOK_URL_PLAYERS,
+    ].filter(Boolean) as string[];
+
+    for (const u of targets) {
+      await Promise.allSettled([
+        safeDelete(env, cooldownKeyFor(u)),
+        safeDelete(env, lastSendKeyFor(u)),
+      ]);
+    }
+    return createJsonResponse({ ok: true, did: "clear-cooldowns", count: targets.length });
+  }
+
+  if (action === "reset-ua") {
+    if (!keepId) return createJsonResponse({ ok: false, error: "missing ?keep" }, 400);
+    await Promise.allSettled([
+      safePutIfChanged(env, `ua:state:${keepId}`, "0"),
+      safeDelete(env, `alert:ua:start:${keepId}`),
+      safeDelete(env, `alert:ua:nobanner:${keepId}`),
+      safeDelete(env, `alert:ua:header:${keepId}`),
+      safeDelete(env, `ua:suppress:${keepId}`),
+    ]);
+    return createJsonResponse({ ok: true, did: "reset-ua", keep: keepId });
+  }
+
+  if (action === "clear-cap") {
+    if (!keepId || !realm) {
+      return createJsonResponse({ ok: false, error: "missing ?keep and/or ?realm" }, 400);
+    }
+    const keys = [
+      capOnceKey(keepId, realm),          // cap:once:<keep>:<newOwner>
+      capSeenKey(keepId, realm),          // cap:seen:<keep>:<newOwner>
+      // best-effort: last minute bucket is unknown; this just clears the stable gates
+    ];
+    if (prev) keys.push(capOnceTransitionKey(keepId, prev, realm)); // cap:once:<keep>:<prev->new>
+
+    for (const k of keys) await safeDelete(env, k);
+    return createJsonResponse({ ok: true, did: "clear-cap", keep: keepId, realm, prev: prev ?? null });
+  }
+
+  // ----- read-only health snapshot -----
+  const wm = await env.WARMAP.get<WarmapData>("warmap", "json");
+  const warmap = wm
+    ? {
+        updatedAt: wm.updatedAt,
+        ageSec: Math.round((now - Date.parse(wm.updatedAt)) / 1000),
+        keeps: wm.keeps.length,
+        events: wm.events.length,
+        headerUA_names: wm.keeps.filter(k => k.headerUnderAttack).map(k => k.name),
+      }
+    : { updatedAt: null, ageSec: null, keeps: 0, events: 0 };
+
+  const [uaState, capState] = await (async () => {
+    if (!keepId) return [{}, {}];
+
+    const baselineOwner = await env.WARMAP.get(`own:${keepId}`);
+    const suppress = await env.WARMAP.get(`ua:suppress:${keepId}`);
+    const uaOn = await env.WARMAP.get(`ua:state:${keepId}`);
+    const uaStart = await env.WARMAP.get(`alert:ua:start:${keepId}`);
+
+    const capOnce =
+      realm ? await env.WARMAP.get(capOnceKey(keepId, realm)) : null;
+    const capSeen =
+      realm ? await env.WARMAP.get(capSeenKey(keepId, realm)) : null;
+    const transOnce =
+      realm && prev
+        ? await env.WARMAP.get(capOnceTransitionKey(keepId, prev, realm))
+        : null;
+
+    return [
+      {
+        keepId,
+        ua_state_value: uaOn ?? null,
+        ua_start_value: uaStart ?? null,
+        ua_suppress_value: suppress ?? null,
+        baseline_owner: (baselineOwner as Realm) ?? null,
+      },
+      {
+        keepId,
+        realm: realm ?? null,
+        cap_once: capOnce ?? null,
+        cap_seen: capSeen ?? null,
+        cap_transition_once: transOnce ?? null,
+      },
+    ];
+  })();
+
+  const webhooks = await Promise.all([
+    readWebhookState("UA/Generic", env.DISCORD_WEBHOOK_URL ?? null),
+    readWebhookState("Capture", env.DISCORD_WEBHOOK_CAPTURE ?? null),
+    readWebhookState("Players", env.DISCORD_WEBHOOK_URL_PLAYERS ?? null),
+  ]);
+
+  return createJsonResponse({
+    ok: true,
+    now: new Date(now).toISOString(),
+    warmap,
+    webhooks,
+    ...(keepId ? { uaState, capState } : {}),
+    hint: "Actions: ?action=clear-cooldowns | ?action=reset-ua&keep=<id> | ?action=clear-cap&keep=<id>&realm=<Realm>[&prev=<Realm>]. Add ?keep=<id>[&realm=<Realm>][&prev=<Realm>] to inspect keys.",
+  });
+});
+
+
 // -------- Simulate a recent "captured" event path -------------
 router.get("/admin/sim-capture-event", async (req, env: Environment) => {
   const q = new URL(req.url).searchParams;
