@@ -408,6 +408,15 @@ async function postToDiscord(
     return false;
   }
 
+// after a successful POST
+const { remaining, resetAfter } = readRateHeaders(resp);
+
+// If we're about to exhaust the bucket, proactively pause THIS webhook
+if (remaining !== null && remaining <= 1) {
+  const backoffSecs = Math.max(1, Math.ceil(resetAfter ?? 1));
+  await setDiscordCooldown(env, url, backoffSecs);
+}
+
   // -------- success --------
   await noteWebhookSent(env, url);
   await noteGlobalSent(env);   // record global last send
@@ -457,6 +466,21 @@ function cooldownKeyFor(url: string) {
   } catch {
     return `discord:cooldown:${url.slice(-16)}`;
   }
+}
+
+function readRateHeaders(resp: Response) {
+  const rem = Number(resp.headers.get("X-RateLimit-Remaining"));
+  let resetAfter = Number(resp.headers.get("X-RateLimit-Reset-After"));
+  if (!Number.isFinite(resetAfter)) {
+    const epoch = Number(resp.headers.get("X-RateLimit-Reset"));
+    if (Number.isFinite(epoch)) {
+      resetAfter = Math.max(0, epoch - Date.now() / 1000);
+    }
+  }
+  return {
+    remaining: Number.isFinite(rem) ? rem : null,
+    resetAfter: Number.isFinite(resetAfter) ? resetAfter : null,
+  };
 }
 
 function relToIsoBucketed(
