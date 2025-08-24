@@ -939,7 +939,11 @@ async function alertOnUnderAttackTransitions(
   );
 }
 
-const WEBHOOK_MIN_INTERVAL_MS = 3000; // ~40/min max, under Discord’s 30/min effective cap
+const WEBHOOK_MIN_INTERVAL_MS = 3600;
+
+// add small jitter to reduce “same-millisecond” races across isolates
+const PACE_JITTER_MIN_MS = 200;
+const PACE_JITTER_MAX_MS = 700;
 
 function lastSendKeyFor(url: string) {
   return `discord:last:${cooldownKeyFor(url)}`;
@@ -953,8 +957,16 @@ async function enforceWebhookPacing(
   const k = lastSendKeyFor(url);
   const lastRaw = await env.WARMAP.get(k);
   const last = lastRaw ? Number(lastRaw) : 0;
+
   const now = Date.now();
-  const wait = last ? minMs - (now - last) : 0;
+  const baseWait = last ? minMs - (now - last) : 0;
+
+  // random jitter per send to avoid two senders aligning perfectly
+  const jitter =
+    Math.floor(Math.random() * (PACE_JITTER_MAX_MS - PACE_JITTER_MIN_MS + 1)) +
+    PACE_JITTER_MIN_MS;
+
+  const wait = Math.max(0, baseWait + jitter);
   if (wait > 0) {
     await new Promise((r) => setTimeout(r, wait));
   }
@@ -963,7 +975,7 @@ async function enforceWebhookPacing(
 async function noteWebhookSent(env: Environment, url: string) {
   await env.WARMAP.put(lastSendKeyFor(url), String(Date.now()), {
     expirationTtl: 60 * 60,
-  }); // keep for an hour
+  });
 }
 
 async function getOrUpdateWarmap(
